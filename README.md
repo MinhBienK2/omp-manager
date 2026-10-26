@@ -220,9 +220,19 @@ omp-manager/
 ├── install.sh               # Script cài đặt tự động vào ~/.local/bin
 ├── .gitignore               # Cấu hình bỏ qua file rác, file tạm
 ├── README.md                # Tài liệu hướng dẫn sử dụng
-└── examples/
-    ├── sample-usage.json    # Snapshot JSON giả lập để kiểm tra offline
-    └── make_sample.py       # Script sinh dữ liệu giả lập mẫu mới
+├── examples/
+│   ├── sample-usage.json    # Snapshot JSON giả lập để kiểm tra offline
+│   └── make_sample.py       # Script sinh dữ liệu giả lập mẫu mới
+└── tests/
+    └── test_recoveries.py   # Unit test (stdlib unittest) cho logic recovery
+```
+
+---
+
+## 🧪 Chạy test
+
+```bash
+python3 -m unittest discover -s tests -v
 ```
 
 ---

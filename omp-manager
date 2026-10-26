@@ -315,7 +315,7 @@ def get_recoveries(accounts: list[dict], now_ms: float) -> list[dict]:
                     "raw_email": a["email"],
                     "bucket": ex.get("label", "Extra"),
                     "recover_pct": ex["used"],
-                    "delta": e["resetsAt"] - now_ms,
+                    "delta": ex["resetsAt"] - now_ms,
                     "resetsAt": ex["resetsAt"],
                 })
     recoveries.sort(key=lambda x: x["delta"])

@@ -1,9 +1,9 @@
 {
-  "generatedAt": 1792999655437,
+  "generatedAt": 1793027297724,
   "reports": [
     {
       "provider": "google-antigravity",
-      "fetchedAt": 1792999625437,
+      "fetchedAt": 1793027267724,
       "metadata": {
         "endpoint": "https://daily-cloudcode-pa.googleapis.com",
         "projectId": "aicode-consumers",
@@ -23,7 +23,7 @@
             "id": "5h",
             "label": "5H",
             "durationMs": 86400000,
-            "resetsAt": 1793017055437
+            "resetsAt": 1793044697724
           },
           "amount": {
             "unit": "percent",
@@ -48,7 +48,7 @@
             "id": "weekly",
             "label": "WEEKLY",
             "durationMs": 604800000,
-            "resetsAt": 1793194055437
+            "resetsAt": 1793221697724
           },
           "amount": {
             "unit": "percent",
@@ -73,7 +73,7 @@
             "id": "5h",
             "label": "5H",
             "durationMs": 86400000,
-            "resetsAt": 1793017355437
+            "resetsAt": 1793044997724
           },
           "amount": {
             "unit": "percent",
@@ -98,7 +98,7 @@
             "id": "weekly",
             "label": "WEEKLY",
             "durationMs": 604800000,
-            "resetsAt": 1793071655437
+            "resetsAt": 1793099297724
           },
           "amount": {
             "unit": "percent",
@@ -123,7 +123,7 @@
             "id": "5h",
             "label": "5H",
             "durationMs": 86400000,
-            "resetsAt": 1793032055437
+            "resetsAt": 1793059697724
           },
           "amount": {
             "unit": "percent",
@@ -139,7 +139,7 @@
     },
     {
       "provider": "google-antigravity",
-      "fetchedAt": 1792999625437,
+      "fetchedAt": 1793027267724,
       "metadata": {
         "endpoint": "https://daily-cloudcode-pa.googleapis.com",
         "projectId": "aicode-consumers",
@@ -159,7 +159,7 @@
             "id": "5h",
             "label": "5H",
             "durationMs": 86400000,
-            "resetsAt": 1793017055437
+            "resetsAt": 1793044697724
           },
           "amount": {
             "unit": "percent",
@@ -184,7 +184,7 @@
             "id": "weekly",
             "label": "WEEKLY",
             "durationMs": 604800000,
-            "resetsAt": 1793194055437
+            "resetsAt": 1793221697724
           },
           "amount": {
             "unit": "percent",
@@ -209,7 +209,7 @@
             "id": "5h",
             "label": "5H",
             "durationMs": 86400000,
-            "resetsAt": 1793017355437
+            "resetsAt": 1793044997724
           },
           "amount": {
             "unit": "percent",
@@ -234,7 +234,7 @@
             "id": "weekly",
             "label": "WEEKLY",
             "durationMs": 604800000,
-            "resetsAt": 1793071655437
+            "resetsAt": 1793099297724
           },
           "amount": {
             "unit": "percent",
@@ -250,7 +250,7 @@
     },
     {
       "provider": "google-antigravity",
-      "fetchedAt": 1792999625437,
+      "fetchedAt": 1793027267724,
       "metadata": {
         "endpoint": "https://daily-cloudcode-pa.googleapis.com",
         "projectId": "aicode-consumers",
@@ -270,7 +270,7 @@
             "id": "5h",
             "label": "5H",
             "durationMs": 86400000,
-            "resetsAt": 1793017055437
+            "resetsAt": 1793044697724
           },
           "amount": {
             "unit": "percent",
@@ -295,7 +295,7 @@
             "id": "weekly",
             "label": "WEEKLY",
             "durationMs": 604800000,
-            "resetsAt": 1793194055437
+            "resetsAt": 1793221697724
           },
           "amount": {
             "unit": "percent",
@@ -320,7 +320,7 @@
             "id": "5h",
             "label": "5H",
             "durationMs": 86400000,
-            "resetsAt": 1793017355437
+            "resetsAt": 1793044997724
           },
           "amount": {
             "unit": "percent",
@@ -345,7 +345,7 @@
             "id": "weekly",
             "label": "WEEKLY",
             "durationMs": 604800000,
-            "resetsAt": 1793071655437
+            "resetsAt": 1793099297724
           },
           "amount": {
             "unit": "percent",
