@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Caches and temporary files
+*.bak*
+*.tmp
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Snapshots and archives
+*.tar.gz
+*.zip
+usage-snapshot*.json
+.cache/

@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Compatibility wrapper: forwards 'ompagy' invocations to 'omp-manager'."""
+import os
+import sys
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+omp_manager = os.path.join(script_dir, "omp-manager")
+
+if os.path.isfile(omp_manager):
+    os.execv(sys.executable, [sys.executable, omp_manager] + sys.argv[1:])
+else:
+    sys.stderr.write("Error: omp-manager script not found.\n")
+    sys.exit(1)

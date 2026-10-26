@@ -1,0 +1,699 @@
+#!/usr/bin/env python3
+"""omp-manager - Antigravity quota dashboard for omp.
+
+Reads `omp usage --json`, merges duplicated shared meters, scores every
+account, and prints a ranked table:
+
+    columns: Gemini 5h | Gemini 1w | Claude&GPT 5h | Claude&GPT 1w
+    cells:   usage bar + % used + time until reset
+    rows:    every authenticated account, best -> worst
+
+Data-driven: accounts and meters are discovered from the report, so adding
+an account (or a new meter) later needs no code change.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+PROVIDER = "google-antigravity"
+
+# Canonical bucket order shown in the table.
+BUCKETS = ["gemini-5h", "gemini-1w", "shared-5h", "shared-1w"]
+BUCKET_TITLES = {
+    "gemini-5h": "GEMINI 5H",
+    "gemini-1w": "GEMINI 1W",
+    "shared-5h": "C&G 5H",
+    "shared-1w": "C&G 1W",
+}
+# Ranking presets: how much each bucket moves the score (each sums to 1).
+# Gemini is the primary workload, so it carries the ranking by default.
+PRESETS = {
+    "gemini":   {"gemini-5h": 0.30, "gemini-1w": 0.40, "shared-5h": 0.10, "shared-1w": 0.20},
+    "balanced": {"gemini-5h": 0.20, "gemini-1w": 0.30, "shared-5h": 0.20, "shared-1w": 0.30},
+    "claude":   {"gemini-5h": 0.10, "gemini-1w": 0.20, "shared-5h": 0.30, "shared-1w": 0.40},
+}
+DEFAULT_PRESET = "gemini"
+
+# Window ids omp may report -> canonical bucket suffix.
+RAW_WINDOWS = {"5h": "5h", "5-hour": "5h", "hour5": "5h", "rolling-5h": "5h",
+               "weekly": "1w", "week": "1w", "1w": "1w", "7d": "1w",
+               "daily": "daily", "day": "daily", "1d": "daily", "24h": "daily"}
+GRADES = [(90, "S", "fresh"), (75, "A", "ready"), (55, "B", "ok"), (35, "C", "tired"), (15, "D", "critical"), (-1, "F", "dead")]
+
+
+# ----------------------------------------------------------------- terminal --
+def supports_color(force: str) -> bool:
+    if force == "always":
+        return True
+    if force == "never":
+        return False
+    return sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
+
+
+class Ink:
+    def __init__(self, enabled: bool):
+        self.on = enabled
+
+    def _w(self, code: str, text: str) -> str:
+        if not text:
+            return text
+        return f"\033[{code}m{text}\033[0m" if self.on else text
+
+    def dim(self, t: str) -> str:
+        return self._w("2", t)
+
+    def bold(self, t: str) -> str:
+        return self._w("1", t)
+
+    def green(self, t: str) -> str:
+        return self._w("38;5;42", t)
+
+    def yellow(self, t: str) -> str:
+        return self._w("38;5;220", t)
+
+    def orange(self, t: str) -> str:
+        return self._w("38;5;208", t)
+
+    def red(self, t: str) -> str:
+        return self._w("38;5;203", t)
+
+    def grey(self, t: str) -> str:
+        return self._w("38;5;245", t)
+
+    def cyan(self, t: str) -> str:
+        return self._w("38;5;51", t)
+
+
+def remaining_color(ink: Ink, remaining_pct: float):
+    if remaining_pct <= 0:
+        return ink.red
+    if remaining_pct >= 50:
+        return ink.green
+    if remaining_pct >= 20:
+        return ink.yellow
+    if remaining_pct >= 5:
+        return ink.orange
+    return ink.red
+
+
+def bar(ink: Ink, remaining_fraction: float, width: int, color) -> str:
+    filled = int(round(remaining_fraction * width))
+    filled = max(0, min(width, filled))
+    return color("█" * filled) + ink.grey("░" * (width - filled))
+
+
+# ------------------------------------------------------------------- helpers --
+def fmt_delta(ms: float) -> str:
+    if ms <= 0:
+        return "now"
+    seconds = ms / 1000.0
+    days, rem = divmod(seconds, 86400)
+    hours = int(rem // 3600)
+    minutes = int((rem % 3600) // 60)
+    secs = int(rem % 60)
+    if days:
+        return f"{int(days)}d{hours}h" if hours else f"{int(days)}d"
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes >= 10:
+        return f"{minutes}m"
+    if minutes == 0 and secs == 0:
+        return "<1s"
+    return f"{minutes}m{secs:02d}s"
+
+
+def fmt_age(ms: float) -> str:
+    return f"{fmt_delta(ms)} ago" if ms >= 0 else "just now"
+
+
+def classify(limit: dict) -> str | None:
+    """Map a limit to one of the canonical buckets, or None.
+
+    Strict on purpose: an unfamiliar meter (say `gemini-pro-5h`) must land in
+    the "other meters" list rather than silently overwrite a real bucket.
+    """
+    tail = limit["id"].split(":")[-1].lower()
+    raw_window = ((limit.get("window") or {}).get("id") or "").lower()
+    window = RAW_WINDOWS.get(raw_window)
+    if window is None:
+        return None
+    if window in ("5h", "1w"):
+        for prefix, kind in (("gemini", "gemini"), ("3p", "shared")):
+            if not tail.startswith(prefix):
+                continue
+            rest = tail[len(prefix):].lstrip("-")
+            return f"{kind}-{window}" if rest in RAW_WINDOWS else None
+    elif window == "daily":
+        parts = limit["id"].split(":")
+        vendor = parts[1].lower() if len(parts) > 1 else ""
+        if vendor == "google" or "google" in tail or "gemini" in tail:
+            return "gemini-daily"
+        elif vendor in ("anthropic", "openai") or "3p" in tail:
+            return "shared-daily"
+    return None
+
+
+# --------------------------------------------------------------------- parse --
+def merge_limit(acc: dict, limit: dict) -> None:
+    key = classify(limit)
+    amount = limit.get("amount") or {}
+    if key is None:
+        acc["extra"].append(
+            {
+                "id": limit["id"],
+                "label": limit.get("label", limit["id"]),
+                "used": float(amount.get("used") or 0.0),
+                "resetsAt": (limit.get("window") or {}).get("resetsAt"),
+                "status": limit.get("status", "unknown"),
+            }
+        )
+        return
+    used = float(amount.get("used") or 0.0)
+    entry = {
+        "used": used,
+        "remaining": float(amount.get("remaining") if amount.get("remaining") is not None else 100.0 - used),
+        "resetsAt": (limit.get("window") or {}).get("resetsAt"),
+        "durationMs": (limit.get("window") or {}).get("durationMs"),
+        "status": limit.get("status", "unknown"),
+    }
+    if key in ("gemini-daily", "shared-daily"):
+        target = "gemini-5h" if "gemini" in key else "shared-5h"
+        if target not in acc["buckets"]:
+            acc["buckets"][target] = entry
+    else:
+        prev = acc["buckets"].get(key)
+        if prev is None or entry["used"] > prev["used"]:
+            acc["buckets"][key] = entry
+
+
+def parse(payload: dict) -> list[dict]:
+    accounts: list[dict] = []
+    for report in payload.get("reports") or []:
+        if report.get("provider") != PROVIDER:
+            continue
+        md = report.get("metadata") or {}
+        email = md.get("email") or md.get("accountId") or "unknown"
+        acc = {"email": email, "fetchedAt": report.get("fetchedAt") or 0, "buckets": {}, "extra": []}
+        for limit in report.get("limits") or []:
+            merge_limit(acc, limit)
+        accounts.append(acc)
+    accounts.sort(key=lambda a: a["email"].lower())
+    return accounts
+
+
+def resolve_weights(preset: str) -> tuple[dict, str]:
+    """OMP_MANAGER_WEIGHTS or OMPAGY_WEIGHTS (4 comma-separated numbers, BUCKETS order) wins."""
+    raw = os.environ.get("OMP_MANAGER_WEIGHTS") or os.environ.get("OMPAGY_WEIGHTS", "")
+    if raw.strip():
+        try:
+            parts = [float(x) for x in raw.split(",")]
+            if len(parts) != len(BUCKETS):
+                raise ValueError
+            total = sum(parts)
+            if total <= 0:
+                raise ValueError
+            return ({b: p / total for b, p in zip(BUCKETS, parts)}, "custom weights")
+        except ValueError:
+            sys.stderr.write("omp-manager: ignoring bad weights environment variable, falling back to preset\n")
+    return dict(PRESETS[preset]), preset
+
+
+def score_account(acc: dict, weights: dict) -> float:
+    total = 0.0
+    for bucket, weight in weights.items():
+        entry = acc["buckets"].get(bucket)
+        remaining = entry["remaining"] if entry else 100.0  # unreported window == fresh
+        total += weight * max(0.0, min(100.0, remaining))
+    return total
+
+
+def grade(score: float):
+    for threshold, letter, word in GRADES:
+        if score >= threshold:
+            return letter, word
+    return "F", "dead"
+
+
+def exhausted_count(acc: dict) -> int:
+    return sum(1 for b in BUCKETS if (e := acc["buckets"].get(b)) and e["remaining"] <= 0)
+
+
+# --------------------------------------------------------------------- fetch --
+def fetch(args, ink: Ink) -> dict:
+    if args.input:
+        try:
+            with open(args.input) as fh:
+                return json.load(fh)
+        except OSError as exc:
+            die(ink, f"cannot read {args.input}: {exc}")
+        except json.JSONDecodeError:
+            die(ink, f"{args.input} is not valid JSON")
+    cmd = ["omp"]
+    if args.profile:
+        cmd += ["--profile", args.profile]
+    if args.refresh:
+        subprocess.run(cmd + ["usage", "invalidate", "--provider", PROVIDER],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    cmd += ["usage", "--json"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
+    except FileNotFoundError:
+        die(ink, "omp CLI not found on PATH")
+    except subprocess.TimeoutExpired:
+        die(ink, f"omp usage timed out after {args.timeout}s")
+    if proc.returncode != 0:
+        die(ink, "omp usage failed:\n" + (proc.stderr or proc.stdout).strip()[:500])
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        die(ink, "omp usage returned non-JSON output")
+
+
+def die(ink: Ink, message: str) -> None:
+    sys.stderr.write(ink.red("omp-manager: ") + message + "\n")
+    raise SystemExit(1)
+
+
+# --------------------------------------------------------------------- render --
+def cell(ink: Ink, acc: dict, bucket: str, now_ms: float, width_bar: int) -> str:
+    entry = acc["buckets"].get(bucket)
+    if entry is None:
+        return ink.grey("·" * width_bar) + " " + ink.grey("  n/r ") + " " + ink.grey("  -  ")
+    remaining = entry["remaining"]
+    color = remaining_color(ink, remaining)
+    pct = f"{entry['used']:>5.1f}%"
+    reset = fmt_delta(entry["resetsAt"] - now_ms) if entry.get("resetsAt") else "-"
+    return f"{bar(ink, remaining / 100.0, width_bar, color)} {color(pct)} {ink.grey(f'{reset:>5}')}"
+
+
+def get_recoveries(accounts: list[dict], now_ms: float) -> list[dict]:
+    recoveries = []
+    for a in accounts:
+        for b in BUCKETS:
+            e = a["buckets"].get(b)
+            if e and e["used"] > 0 and e.get("resetsAt") and e["resetsAt"] > now_ms:
+                recoveries.append({
+                    "email": short(a["email"]),
+                    "raw_email": a["email"],
+                    "bucket": BUCKET_TITLES[b],
+                    "recover_pct": e["used"],
+                    "delta": e["resetsAt"] - now_ms,
+                    "resetsAt": e["resetsAt"],
+                })
+        for ex in a.get("extra", []):
+            if ex.get("used", 0) > 0 and ex.get("resetsAt") and ex["resetsAt"] > now_ms:
+                recoveries.append({
+                    "email": short(a["email"]),
+                    "raw_email": a["email"],
+                    "bucket": ex.get("label", "Extra"),
+                    "recover_pct": ex["used"],
+                    "delta": e["resetsAt"] - now_ms,
+                    "resetsAt": ex["resetsAt"],
+                })
+    recoveries.sort(key=lambda x: x["delta"])
+    return recoveries
+
+
+BAR = 6
+ACCT_MAX = 34
+
+
+def short(email: str) -> str:
+    if len(email) <= ACCT_MAX:
+        return email
+    local, _, domain = email.partition("@")
+    keep = ACCT_MAX - len(domain) - 2
+    return f"{local[:max(3, keep)]}…@{domain}" if domain else email[:ACCT_MAX]
+
+
+def acct_w(accounts: list[dict]) -> int:
+    return max((len(short(a["email"])) for a in accounts), default=20)
+
+
+def cell_w() -> int:
+    return BAR + 1 + 6 + 1 + 5
+
+
+def accent_color(ink: Ink, acc: dict, text: str):
+    score = acc["score"]
+    letter, _ = grade(score)
+    return {"S": ink.green, "A": ink.green, "B": ink.cyan, "C": ink.yellow,
+            "D": ink.orange, "F": ink.red}.get(letter, ink.grey)(text)
+
+
+def score_str(ink: Ink, acc: dict) -> str:
+    letter, word = grade(acc["score"])
+    color = {"S": ink.green, "A": ink.green, "B": ink.cyan, "C": ink.yellow,
+             "D": ink.orange, "F": ink.red}.get(letter, ink.grey)
+    score_val = f"{acc['score']:>5.1f}"
+    return f"{ink.bold(score_val)}  {color(f'{letter} · {word}')}"
+
+def _display_len(s: str) -> int:
+    out, i = 0, 0
+    while i < len(s):
+        if s[i] == "\033":
+            while i < len(s) and s[i] != "m":
+                i += 1
+            i += 1
+            continue
+        out += 1
+        i += 1
+    return out
+
+
+def pad(s: str, width: int) -> str:
+    """Right-pad to `width` visible columns, ignoring ANSI escapes."""
+    missing = width - _display_len(s)
+    return s + " " * missing if missing > 0 else s
+
+
+def fmt_stamp(ms: float) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def render_table(ink: Ink, accounts: list[dict], now_ms: float, narrow: bool) -> str:
+    rows = []
+    aw = acct_w(accounts)
+    cw = cell_w()
+    head_cols = [
+        ("#", 2),
+        ("ACCOUNT", aw),
+        (BUCKET_TITLES["gemini-5h"], cw),
+        (BUCKET_TITLES["gemini-1w"], cw),
+        (BUCKET_TITLES["shared-5h"], cw),
+        (BUCKET_TITLES["shared-1w"], cw),
+        ("SCORE", 5),
+        ("GRADE", 9),
+    ]
+
+    if not narrow:
+        top = ink.grey("╭─" + "─┬─".join("─" * w for _, w in head_cols) + "─╮")
+        hdr = ink.grey("│ ") + ink.grey(" │ ").join(ink.bold(pad(title, w)) for title, w in head_cols) + ink.grey(" │")
+        mid = ink.grey("├─" + "─┼─".join("─" * w for _, w in head_cols) + "─┤")
+        bot = ink.grey("╰─" + "─┴─".join("─" * w for _, w in head_cols) + "─╯")
+
+        rows.append(top)
+        rows.append(hdr)
+        rows.append(mid)
+
+        for idx, acc in enumerate(accounts, 1):
+            letter, word = grade(acc["score"])
+            score_val = f"{acc['score']:>5.1f}"
+            grade_val = f"{letter} · {word}"
+            c_vals = [
+                f"{idx:>2}",
+                accent_color(ink, acc, short(acc["email"])),
+                cell(ink, acc, "gemini-5h", now_ms, BAR),
+                cell(ink, acc, "gemini-1w", now_ms, BAR),
+                cell(ink, acc, "shared-5h", now_ms, BAR),
+                cell(ink, acc, "shared-1w", now_ms, BAR),
+                ink.bold(score_val),
+                ink.cyan(grade_val) if letter in ("S", "A") else (ink.yellow(grade_val) if letter in ("B", "C") else ink.red(grade_val)),
+            ]
+            row_str = ink.grey("│ ") + ink.grey(" │ ").join(pad(v, w) for v, (_, w) in zip(c_vals, head_cols)) + ink.grey(" │")
+            rows.append(row_str)
+
+        rows.append(bot)
+    else:
+        for idx, acc in enumerate(accounts, 1):
+            letter, word = grade(acc["score"])
+            title = f" {idx}. {short(acc['email'])} "
+            score_tag = f" {acc['score']:>5.1f} · {letter} · {word} "
+            card_w = 72
+            dashes = card_w - 4 - len(title) - len(score_tag)
+            dashes = max(2, dashes)
+            top = ink.grey("╭─") + ink.bold(accent_color(ink, acc, title)) + ink.grey("─" * dashes) + ink.cyan(score_tag) + ink.grey("─╮")
+            bot = ink.grey("╰" + "─" * 34 + "┴" + "─" * 35 + "╯")
+
+            row1 = (ink.grey("│ ") + pad(f"{BUCKET_TITLES['gemini-5h']} " + cell(ink, acc, "gemini-5h", now_ms, BAR), 32) +
+                    ink.grey(" │ ") + pad(f"{BUCKET_TITLES['shared-5h']} " + cell(ink, acc, "shared-5h", now_ms, BAR), 33) + ink.grey(" │"))
+            row2 = (ink.grey("│ ") + pad(f"{BUCKET_TITLES['gemini-1w']} " + cell(ink, acc, "gemini-1w", now_ms, BAR), 32) +
+                    ink.grey(" │ ") + pad(f"{BUCKET_TITLES['shared-1w']} " + cell(ink, acc, "shared-1w", now_ms, BAR), 33) + ink.grey(" │"))
+            rows.extend([top, row1, row2, bot, ""])
+    return "\n".join(rows)
+
+
+def render_card(ink: Ink, payload: dict, accounts: list[dict], now_ms: float, narrow: bool, stale: bool, freshest: float, generated: float) -> list[str]:
+    lines = []
+    recoveries = get_recoveries(accounts, now_ms)
+    cap = (payload.get("capacity") or {}).get(PROVIDER) or []
+    cap_5h = next((f"{c['remainingAccounts']:.1f}x 5h" for c in cap if c.get("window") == "5h"), "")
+    cap_1w = next((f"{c['remainingAccounts']:.1f}x 1w" for c in cap if c.get("window") == "7d"), "")
+    cap_str = " · ".join(filter(None, [cap_5h, cap_1w]))
+
+    def best_for(kind: str):
+        cands = [a for a in accounts if (a["buckets"].get(f"{kind}-5h") or {}).get("remaining", 100) > 0
+                 or (a["buckets"].get(f"{kind}-1w") or {}).get("remaining", 100) > 0]
+        if not cands:
+            return None
+        return min(cands, key=lambda a: (-min((a["buckets"].get(f"{kind}-5h") or {}).get("remaining", 100.0),
+                                              (a["buckets"].get(f"{kind}-1w") or {}).get("remaining", 100.0)),
+                                         -a["score"], a["email"].lower()))
+
+    gem = best_for("gemini")
+    claude = best_for("shared")
+
+    if not narrow:
+        card_w = 98
+        header_title = f" ANTIGRAVITY QUOTA · {len(accounts)} accounts "
+        snap_text = f" snapshot {fmt_age(freshest)} " if not stale else " STALE - rerun with --refresh "
+        mid_dashes = card_w - 2 - len(header_title) - len(snap_text)
+        mid_dashes = max(2, mid_dashes)
+        snap_colored = ink.yellow(snap_text) if stale else ink.grey(snap_text)
+        top_line = ink.grey("╭─") + ink.bold(ink.cyan(header_title)) + ink.grey("─" * mid_dashes) + snap_colored + ink.grey("─╮")
+        lines.append(top_line)
+
+        left_lines = []
+        for b in BUCKETS:
+            entries = [a["buckets"].get(b) for a in accounts]
+            reported = [e for e in entries if e]
+            used_pct = (sum(e["used"] for e in reported) / len(reported)) if reported else 0.0
+            free_cnt = len([a for a, e in zip(accounts, entries) if not e or e["remaining"] > 0])
+            bar_str = bar(ink, max(0.0, 100.0 - used_pct) / 100.0, 10, remaining_color(ink, 100 - used_pct))
+            left_lines.append(f"{BUCKET_TITLES[b]:<9} {bar_str} {used_pct:>5.1f}% ({free_cnt}/{len(accounts)} ready)")
+
+        right_lines = []
+        gem_str = ink.green(short(gem["email"])) if gem else ink.red("none")
+        claude_str = ink.green(short(claude["email"])) if claude else ink.red("none")
+        right_lines.append(f"★ Best Gemini : {gem_str}")
+        right_lines.append(f"★ Best Claude : {claude_str}")
+
+        if recoveries:
+            r0 = recoveries[0]
+            right_lines.append(f"⚡ Next relief : {ink.cyan(r0['email'].split('@')[0])} (+{r0['recover_pct']:.0f}% {r0['bucket']} in {fmt_delta(r0['delta'])})")
+        else:
+            right_lines.append("⚡ Next relief : All quotas 100% full")
+
+        right_lines.append(f"⟳ Pool Cap    : {ink.grey(cap_str if cap_str else 'N/A')}")
+
+        lw = 46
+        rw = 48
+        div = ink.grey(" │ ")
+        border_l = ink.grey("│ ")
+        border_r = ink.grey(" │")
+        for l_txt, r_txt in zip(left_lines, right_lines):
+            lines.append(border_l + pad(l_txt, lw) + div + pad(r_txt, rw) + border_r)
+
+        lines.append(ink.grey("╰" + "─" * (lw + 2) + "┴" + "─" * (rw + 2) + "╯"))
+    else:
+        card_w = 72
+        header_title = f" ANTIGRAVITY QUOTA · {len(accounts)} accounts "
+        snap_text = f" {fmt_age(freshest)} " if not stale else " STALE "
+        dashes = card_w - 2 - len(header_title) - len(snap_text)
+        dashes = max(2, dashes)
+        snap_colored = ink.yellow(snap_text) if stale else ink.grey(snap_text)
+        top_line = ink.grey("╭─") + ink.bold(ink.cyan(header_title)) + ink.grey("─" * dashes) + snap_colored + ink.grey("─╮")
+        lines.append(top_line)
+
+        for b in BUCKETS:
+            entries = [a["buckets"].get(b) for a in accounts]
+            reported = [e for e in entries if e]
+            used_pct = (sum(e["used"] for e in reported) / len(reported)) if reported else 0.0
+            free_cnt = len([a for a, e in zip(accounts, entries) if not e or e["remaining"] > 0])
+            bar_str = bar(ink, max(0.0, 100.0 - used_pct) / 100.0, 12, remaining_color(ink, 100 - used_pct))
+            content = f" {BUCKET_TITLES[b]:<9} {bar_str} {used_pct:>5.1f}% ({free_cnt}/{len(accounts)} ready)"
+            lines.append(ink.grey("│") + pad(content, card_w - 2) + ink.grey("│"))
+
+        lines.append(ink.grey("├" + "─" * (card_w - 2) + "┤"))
+
+        gem_str = ink.green(short(gem["email"])) if gem else ink.red("none")
+        claude_str = ink.green(short(claude["email"])) if claude else ink.red("none")
+        lines.append(ink.grey("│") + pad(f" ★ Best Gemini : {gem_str}", card_w - 2) + ink.grey("│"))
+        lines.append(ink.grey("│") + pad(f" ★ Best Claude : {claude_str}", card_w - 2) + ink.grey("│"))
+        if recoveries:
+            r0 = recoveries[0]
+            lines.append(ink.grey("│") + pad(f" ⚡ Next relief : {ink.cyan(r0['email'].split('@')[0])} (+{r0['recover_pct']:.0f}% {r0['bucket']} in {fmt_delta(r0['delta'])})", card_w - 2) + ink.grey("│"))
+        lines.append(ink.grey("│") + pad(f" ⟳ Pool Cap    : {ink.grey(cap_str if cap_str else 'N/A')}", card_w - 2) + ink.grey("│"))
+        lines.append(ink.grey("╰" + "─" * (card_w - 2) + "╯"))
+
+    return lines
+
+
+def render_mini(ink: Ink, payload: dict, accounts: list[dict], now_ms: float) -> str:
+    g5 = [a["buckets"].get("gemini-5h") for a in accounts]
+    g5_rep = [e for e in g5 if e]
+    g5_rem = (100 - (sum(e["used"] for e in g5_rep) / len(g5_rep))) if g5_rep else 100.0
+    g5_cnt = len([a for a, e in zip(accounts, g5) if not e or e["remaining"] > 0])
+
+    g1 = [a["buckets"].get("gemini-1w") for a in accounts]
+    g1_rep = [e for e in g1 if e]
+    g1_rem = (100 - (sum(e["used"] for e in g1_rep) / len(g1_rep))) if g1_rep else 100.0
+    g1_cnt = len([a for a, e in zip(accounts, g1) if not e or e["remaining"] > 0])
+
+    best = accounts[0]
+    letter, _ = grade(best["score"])
+
+    parts = [
+        f"{ink.bold('[AGY ' + str(len(accounts)) + 'acc]')}",
+        f"G5h: {remaining_color(ink, g5_rem)(f'{g5_rem:.0f}%')} ({g5_cnt}/{len(accounts)})",
+        f"G1w: {remaining_color(ink, g1_rem)(f'{g1_rem:.0f}%')} ({g1_cnt}/{len(accounts)})",
+        f"Best: {ink.green(short(best['email']).split('@')[0])} ({best['score']:.0f} {letter})",
+    ]
+    recoveries = get_recoveries(accounts, now_ms)
+    if recoveries:
+        r0 = recoveries[0]
+        parts.append(f"Next: {ink.cyan(r0['email'].split('@')[0])} (+{r0['recover_pct']:.0f}% in {fmt_delta(r0['delta'])})")
+    return " · ".join(parts)
+
+
+def render(ink: Ink, payload: dict, accounts: list[dict], args, weights: dict, preset: str) -> str:
+    now_ms = time.time() * 1000
+    generated = payload.get("generatedAt") or now_ms
+    ages = [now_ms - a["fetchedAt"] for a in accounts if a["fetchedAt"]]
+    freshest = min(ages) if ages else 0
+    oldest = max(ages) if ages else 0
+    stale = oldest > args.stale * 1000
+
+    head_cols_len = 2 + acct_w(accounts) + (cell_w() * 4) + 5 + 9 + 3 * 7 + 4
+    is_narrow = args.narrow or term_width() < head_cols_len
+
+    out = render_card(ink, payload, accounts, now_ms, narrow=is_narrow, stale=stale, freshest=freshest, generated=generated)
+    out.append("")
+    out.append(ink.bold("RANKING  " + ink.grey(f"(best -> worst · ranked by {preset})")))
+    out.append(render_table(ink, accounts, now_ms, narrow=is_narrow))
+    out.append("")
+
+    extras = [(a["email"], e) for a in accounts for e in a["extra"]]
+    if extras:
+        out.append(ink.bold("OTHER METERS") + ink.grey("  (not part of the score)"))
+        for email, e in extras:
+            reset = f"reset {fmt_delta(e['resetsAt'] - now_ms)}" if e.get("resetsAt") else ""
+            left_pct = 100 - e["used"]
+            out.append(f"  {pad(email, acct_w(accounts))}  {pad(e['label'], 16)} "
+                       f"{ink.grey(f'{left_pct:>5.1f}% left · {reset}')}")
+        out.append("")
+    for name in ("accountsWithoutUsage", "disabledCredentials"):
+        rows = payload.get(name) or []
+        if rows:
+            out.append(ink.bold(name.upper()))
+            for r in rows:
+                out.append("  " + (r if isinstance(r, str) else json.dumps(r))[:120])
+            out.append("")
+
+    out.append(ink.grey(f"score weights ({preset}): "
+                        + "  ".join(f"{BUCKET_TITLES[b]} {weights[b]:.2f}" for b in BUCKETS)
+                        + " · n/r = window not reported (counted as fresh)"
+                        + " · switch with --by gemini|balanced|claude"))
+    return "\n".join(out)
+
+def term_width() -> int:
+    env = os.environ.get("COLUMNS")
+    if env and env.isdigit():
+        return int(env)
+    return shutil.get_terminal_size((120, 24)).columns
+
+
+# ----------------------------------------------------------------------- main --
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="omp-manager", description="Ranked Antigravity quota dashboard for omp")
+    ap.add_argument("--refresh", action="store_true", help="invalidate omp's cache before reading")
+    ap.add_argument("--input", metavar="FILE", help="render a saved `omp usage --json` snapshot instead of fetching")
+    ap.add_argument("--profile", default=os.environ.get("OMP_MANAGER_PROFILE") or os.environ.get("OMPAGY_PROFILE"), help="omp profile to query")
+    ap.add_argument("--by", choices=sorted(PRESETS), default=os.environ.get("OMP_MANAGER_BY") or os.environ.get("OMPAGY_BY", DEFAULT_PRESET),
+                    help="what the score is weighted toward (default: gemini)")
+    ap.add_argument("--sort", choices=["score", "reset", "name"], default="score",
+                    help="ranking key (default: score)")
+    ap.add_argument("--narrow", action="store_true", help="force stacked layout")
+    ap.add_argument("--mini", "-1", action="store_true", help="output a single-line summary (for tmux/prompt)")
+    ap.add_argument("--json", action="store_true", help="emit the computed model as JSON")
+    ap.add_argument("--color", choices=["auto", "always", "never"], default="auto")
+    ap.add_argument("--stale", type=float, default=900, metavar="SEC",
+                    help="warn when the oldest snapshot is older than this (default 900)")
+    ap.add_argument("--timeout", type=float, default=180)
+    args = ap.parse_args()
+
+    ink = Ink(supports_color(args.color))
+    payload = fetch(args, ink)
+    accounts = parse(payload)
+    if not accounts:
+        die(ink, f"no {PROVIDER} usage reports in omp output")
+    weights, preset = resolve_weights(args.by)
+    for a in accounts:
+        a["score"] = round(score_account(a, weights), 1)
+        a["exhausted"] = exhausted_count(a)
+
+    def reset_key(a):
+        times = [e["resetsAt"] for b in BUCKETS if (e := a["buckets"].get(b)) and 0 < e["remaining"] < 100]
+        return min(times) if times else float("inf")
+
+    if args.sort == "score":
+        accounts.sort(key=lambda a: (-a["score"], a["exhausted"], a["email"].lower()))
+    elif args.sort == "reset":
+        accounts.sort(key=lambda a: (reset_key(a), -a["score"], a["email"].lower()))
+    else:
+        accounts.sort(key=lambda a: a["email"].lower())
+    if args.mini:
+        print(render_mini(ink, payload, accounts, time.time() * 1000))
+        return
+
+    if args.json:
+        now_ms = time.time() * 1000
+        out = []
+        for a in accounts:
+            out.append({
+                "email": a["email"],
+                "score": round(a["score"], 2),
+                "grade": grade(a["score"])[0],
+                "exhaustedBuckets": a["exhausted"],
+                "fetchedAt": a["fetchedAt"],
+                "buckets": {
+                    b: (None if b not in a["buckets"] else {
+                        "usedPct": round(a["buckets"][b]["used"], 2),
+                        "remainingPct": round(a["buckets"][b]["remaining"], 2),
+                        "resetsAt": a["buckets"][b]["resetsAt"],
+                        "resetInMs": round(a["buckets"][b]["resetsAt"] - now_ms)
+                        if a["buckets"][b].get("resetsAt") else None,
+                        "status": a["buckets"][b]["status"],
+                    }) for b in BUCKETS
+                },
+                "otherMeters": a["extra"],
+            })
+        rec_list = [
+            {
+                "email": r["raw_email"],
+                "bucket": r["bucket"],
+                "recoverPct": round(r["recover_pct"], 2),
+                "resetsAt": r["resetsAt"],
+                "resetInMs": round(r["delta"]),
+            } for r in get_recoveries(accounts, now_ms)
+        ]
+        print(json.dumps({
+            "generatedAt": payload.get("generatedAt"),
+            "accounts": out,
+            "recoveries": rec_list,
+            "capacity": (payload.get("capacity") or {}).get(PROVIDER, []),
+        }, indent=2))
+        return
+    print(render(ink, payload, accounts, args, weights, preset))
+
+
+if __name__ == "__main__":
+    main()

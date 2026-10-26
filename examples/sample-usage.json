@@ -1,0 +1,383 @@
+{
+  "generatedAt": 1792999655437,
+  "reports": [
+    {
+      "provider": "google-antigravity",
+      "fetchedAt": 1792999625437,
+      "metadata": {
+        "endpoint": "https://daily-cloudcode-pa.googleapis.com",
+        "projectId": "aicode-consumers",
+        "email": "alice@example.com"
+      },
+      "limits": [
+        {
+          "id": "google-antigravity:google:default:gemini-5h",
+          "label": "Gemini 5h",
+          "scope": {
+            "provider": "google-antigravity",
+            "projectId": "aicode-consumers",
+            "windowId": "5h",
+            "shared": false
+          },
+          "window": {
+            "id": "5h",
+            "label": "5H",
+            "durationMs": 86400000,
+            "resetsAt": 1793017055437
+          },
+          "amount": {
+            "unit": "percent",
+            "remainingFraction": 0.98,
+            "usedFraction": 0.02,
+            "remaining": 98.0,
+            "used": 2.0,
+            "limit": 100
+          },
+          "status": "ok"
+        },
+        {
+          "id": "google-antigravity:google:default:gemini-weekly",
+          "label": "Gemini Weekly",
+          "scope": {
+            "provider": "google-antigravity",
+            "projectId": "aicode-consumers",
+            "windowId": "weekly",
+            "shared": false
+          },
+          "window": {
+            "id": "weekly",
+            "label": "WEEKLY",
+            "durationMs": 604800000,
+            "resetsAt": 1793194055437
+          },
+          "amount": {
+            "unit": "percent",
+            "remainingFraction": 0.909,
+            "usedFraction": 0.091,
+            "remaining": 90.9,
+            "used": 9.1,
+            "limit": 100
+          },
+          "status": "ok"
+        },
+        {
+          "id": "google-antigravity:anthropic:default:3p-5h",
+          "label": "Claude & GPT (shared)",
+          "scope": {
+            "provider": "google-antigravity",
+            "projectId": "aicode-consumers",
+            "windowId": "5h",
+            "shared": true
+          },
+          "window": {
+            "id": "5h",
+            "label": "5H",
+            "durationMs": 86400000,
+            "resetsAt": 1793017355437
+          },
+          "amount": {
+            "unit": "percent",
+            "remainingFraction": 1.0,
+            "usedFraction": 0.0,
+            "remaining": 100.0,
+            "used": 0.0,
+            "limit": 100
+          },
+          "status": "ok"
+        },
+        {
+          "id": "google-antigravity:openai:default:3p-weekly",
+          "label": "Claude & GPT (shared)",
+          "scope": {
+            "provider": "google-antigravity",
+            "projectId": "aicode-consumers",
+            "windowId": "weekly",
+            "shared": true
+          },
+          "window": {
+            "id": "weekly",
+            "label": "WEEKLY",
+            "durationMs": 604800000,
+            "resetsAt": 1793071655437
+          },
+          "amount": {
+            "unit": "percent",
+            "remainingFraction": 0.34099999999999997,
+            "usedFraction": 0.659,
+            "remaining": 34.099999999999994,
+            "used": 65.9,
+            "limit": 100
+          },
+          "status": "ok"
+        },
+        {
+          "id": "google-antigravity:google:default:gemini-pro-5h",
+          "label": "Gemini Pro 5h",
+          "scope": {
+            "provider": "google-antigravity",
+            "projectId": "aicode-consumers",
+            "windowId": "5h",
+            "shared": false
+          },
+          "window": {
+            "id": "5h",
+            "label": "5H",
+            "durationMs": 86400000,
+            "resetsAt": 1793032055437
+          },
+          "amount": {
+            "unit": "percent",
+            "remainingFraction": 0.875,
+            "usedFraction": 0.125,
+            "remaining": 87.5,
+            "used": 12.5,
+            "limit": 100
+          },
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "provider": "google-antigravity",
+      "fetchedAt": 1792999625437,
+      "metadata": {
+        "endpoint": "https://daily-cloudcode-pa.googleapis.com",
+        "projectId": "aicode-consumers",
+        "email": "bob@example.com"
+      },
+      "limits": [
+        {
+          "id": "google-antigravity:google:default:gemini-5h",
+          "label": "Gemini 5h",
+          "scope": {
+            "provider": "google-antigravity",
+            "projectId": "aicode-consumers",
+            "windowId": "5h",
+            "shared": false
+          },
+          "window": {
+            "id": "5h",
+            "label": "5H",
+            "durationMs": 86400000,
+            "resetsAt": 1793017055437
+          },
+          "amount": {
+            "unit": "percent",
+            "remainingFraction": 0.838,
+            "usedFraction": 0.162,
+            "remaining": 83.8,
+            "used": 16.2,
+            "limit": 100
+          },
+          "status": "ok"
+        },
+        {
+          "id": "google-antigravity:google:default:gemini-weekly",
+          "label": "Gemini Weekly",
+          "scope": {
+            "provider": "google-antigravity",
+            "projectId": "aicode-consumers",
+            "windowId": "weekly",
+            "shared": false
+          },
+          "window": {
+            "id": "weekly",
+            "label": "WEEKLY",
+            "durationMs": 604800000,
+            "resetsAt": 1793194055437
+          },
+          "amount": {
+            "unit": "percent",
+            "remainingFraction": 0.439,
+            "usedFraction": 0.561,
+            "remaining": 43.9,
+            "used": 56.1,
+            "limit": 100
+          },
+          "status": "ok"
+        },
+        {
+          "id": "google-antigravity:anthropic:default:3p-5h",
+          "label": "Claude & GPT (shared)",
+          "scope": {
+            "provider": "google-antigravity",
+            "projectId": "aicode-consumers",
+            "windowId": "5h",
+            "shared": true
+          },
+          "window": {
+            "id": "5h",
+            "label": "5H",
+            "durationMs": 86400000,
+            "resetsAt": 1793017355437
+          },
+          "amount": {
+            "unit": "percent",
+            "remainingFraction": 1.0,
+            "usedFraction": 0.0,
+            "remaining": 100.0,
+            "used": 0.0,
+            "limit": 100
+          },
+          "status": "ok"
+        },
+        {
+          "id": "google-antigravity:openai:default:3p-weekly",
+          "label": "Claude & GPT (shared)",
+          "scope": {
+            "provider": "google-antigravity",
+            "projectId": "aicode-consumers",
+            "windowId": "weekly",
+            "shared": true
+          },
+          "window": {
+            "id": "weekly",
+            "label": "WEEKLY",
+            "durationMs": 604800000,
+            "resetsAt": 1793071655437
+          },
+          "amount": {
+            "unit": "percent",
+            "remainingFraction": 0.48100000000000004,
+            "usedFraction": 0.519,
+            "remaining": 48.1,
+            "used": 51.9,
+            "limit": 100
+          },
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "provider": "google-antigravity",
+      "fetchedAt": 1792999625437,
+      "metadata": {
+        "endpoint": "https://daily-cloudcode-pa.googleapis.com",
+        "projectId": "aicode-consumers",
+        "email": "carol@example.com"
+      },
+      "limits": [
+        {
+          "id": "google-antigravity:google:default:gemini-5h",
+          "label": "Gemini 5h",
+          "scope": {
+            "provider": "google-antigravity",
+            "projectId": "aicode-consumers",
+            "windowId": "5h",
+            "shared": false
+          },
+          "window": {
+            "id": "5h",
+            "label": "5H",
+            "durationMs": 86400000,
+            "resetsAt": 1793017055437
+          },
+          "amount": {
+            "unit": "percent",
+            "remainingFraction": 1.0,
+            "usedFraction": 0.0,
+            "remaining": 100.0,
+            "used": 0.0,
+            "limit": 100
+          },
+          "status": "ok"
+        },
+        {
+          "id": "google-antigravity:google:default:gemini-weekly",
+          "label": "Gemini Weekly",
+          "scope": {
+            "provider": "google-antigravity",
+            "projectId": "aicode-consumers",
+            "windowId": "weekly",
+            "shared": false
+          },
+          "window": {
+            "id": "weekly",
+            "label": "WEEKLY",
+            "durationMs": 604800000,
+            "resetsAt": 1793194055437
+          },
+          "amount": {
+            "unit": "percent",
+            "remainingFraction": 0.005,
+            "usedFraction": 0.995,
+            "remaining": 0.5,
+            "used": 99.5,
+            "limit": 100
+          },
+          "status": "ok"
+        },
+        {
+          "id": "google-antigravity:anthropic:default:3p-5h",
+          "label": "Claude & GPT (shared)",
+          "scope": {
+            "provider": "google-antigravity",
+            "projectId": "aicode-consumers",
+            "windowId": "5h",
+            "shared": true
+          },
+          "window": {
+            "id": "5h",
+            "label": "5H",
+            "durationMs": 86400000,
+            "resetsAt": 1793017355437
+          },
+          "amount": {
+            "unit": "percent",
+            "remainingFraction": 1.0,
+            "usedFraction": 0.0,
+            "remaining": 100.0,
+            "used": 0.0,
+            "limit": 100
+          },
+          "status": "ok"
+        },
+        {
+          "id": "google-antigravity:openai:default:3p-weekly",
+          "label": "Claude & GPT (shared)",
+          "scope": {
+            "provider": "google-antigravity",
+            "projectId": "aicode-consumers",
+            "windowId": "weekly",
+            "shared": true
+          },
+          "window": {
+            "id": "weekly",
+            "label": "WEEKLY",
+            "durationMs": 604800000,
+            "resetsAt": 1793071655437
+          },
+          "amount": {
+            "unit": "percent",
+            "remainingFraction": 0.48100000000000004,
+            "usedFraction": 0.519,
+            "remaining": 48.1,
+            "used": 51.9,
+            "limit": 100
+          },
+          "status": "ok"
+        }
+      ]
+    }
+  ],
+  "accountsWithoutUsage": [],
+  "disabledCredentials": [],
+  "capacity": {
+    "google-antigravity": [
+      {
+        "window": "5h",
+        "durationMs": 18000000,
+        "accounts": 3,
+        "usedAccounts": 0.3,
+        "remainingAccounts": 2.7
+      },
+      {
+        "window": "7d",
+        "durationMs": 604800000,
+        "accounts": 3,
+        "usedAccounts": 2.1,
+        "remainingAccounts": 0.9
+      }
+    ]
+  }
+}
