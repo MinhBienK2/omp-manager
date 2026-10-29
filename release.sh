@@ -3,16 +3,20 @@
 #
 #   ./release.sh 1.3.0 "Mô tả ngắn cho bản cập nhật"
 #
-# Script sẽ:
-#   1. Cập nhật __version__ trong omp-manager
-#   2. Cập nhật version.json (version + description + updatedAt)
-#   3. Commit, push và tạo Git tag
+# Luôn phát hành từ nhánh `main`, vì client đọc version.json từ `main`
+# để biết có bản mới. Phát hành từ nhánh khác sẽ khiến người dùng
+# không nhận được thông báo cập nhật.
 #
-# Sau khi push, mọi máy người dùng sẽ tự phát hiện bản mới và cập nhật.
+# Script sẽ:
+#   1. Kiểm tra working tree sạch, chuyển về main và pull
+#   2. Cập nhật __version__ trong omp-manager
+#   3. Cập nhật version.json (version + description + updatedAt)
+#   4. Chạy test, commit, push lên main và tạo Git tag
 set -euo pipefail
 
 VERSION="${1:-}"
 DESCRIPTION="${2:-}"
+RELEASE_BRANCH="main"
 
 if [ -z "$VERSION" ]; then
   echo "Usage: ./release.sh <version> [description]" >&2
@@ -30,6 +34,28 @@ fi
 
 if ! command -v python3 >/dev/null 2>&1; then
   echo "Lỗi: không tìm thấy python3 trong PATH." >&2
+  exit 1
+fi
+
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  echo "Lỗi: thư mục này không phải git repo." >&2
+  exit 1
+fi
+
+# Working tree phải sạch, nếu không commit có thể lẫn thay đổi ngoài ý muốn.
+if [ -n "$(git status --porcelain)" ]; then
+  echo "Lỗi: working tree không sạch. Commit hoặc stash trước khi phát hành:" >&2
+  git status --short >&2
+  exit 1
+fi
+
+# Phát hành luôn từ main.
+git checkout "$RELEASE_BRANCH"
+git pull --ff-only origin "$RELEASE_BRANCH"
+
+# Tag đã tồn tại -> dừng, tránh ghi đè lịch sử phát hành.
+if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+  echo "Lỗi: tag v${VERSION} đã tồn tại." >&2
   exit 1
 fi
 
@@ -73,11 +99,10 @@ python3 -m unittest discover -s tests >/dev/null && echo "✓ test suite pass"
 git add omp-manager version.json
 git commit -m "release: v${VERSION}${DESCRIPTION:+ - $DESCRIPTION}"
 
-BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-git push origin "$BRANCH"
+git push origin "$RELEASE_BRANCH"
 git tag -a "v${VERSION}" -m "v${VERSION}${DESCRIPTION:+ - $DESCRIPTION}"
 git push origin "v${VERSION}"
 
 echo
-echo "🎉 Đã phát hành v${VERSION} trên nhánh ${BRANCH}."
+echo "🎉 Đã phát hành v${VERSION} trên nhánh ${RELEASE_BRANCH}."
 echo "   Mọi máy người dùng sẽ tự động cập nhật trong tối đa 1 giờ tới."
