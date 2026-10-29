@@ -21,3 +21,6 @@ env/
 *.zip
 usage-snapshot*.json
 .cache/
+
+# Self-update temp files
+*.update.*

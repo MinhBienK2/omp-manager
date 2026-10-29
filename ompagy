@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
-"""Compatibility wrapper: forwards 'ompagy' invocations to 'omp-manager'."""
+"""ompagy - alias entry point for omp-manager.
+
+Both names run the exact same code and expose the exact same features. This
+wrapper only re-points the process at `omp-manager` while keeping the
+`ompagy` identity (program name, cache directory, environment prefix).
+
+Kept as a real file rather than a symlink so the project still works when it
+is downloaded as a zip archive.
+"""
 import os
 import sys
 
-script_dir = os.path.dirname(os.path.abspath(__file__))
+script_dir = os.path.dirname(os.path.realpath(__file__))
 omp_manager = os.path.join(script_dir, "omp-manager")
 
-if os.path.isfile(omp_manager):
-    os.execv(sys.executable, [sys.executable, omp_manager] + sys.argv[1:])
-else:
-    sys.stderr.write("Error: omp-manager script not found.\n")
+if not os.path.isfile(omp_manager):
+    sys.stderr.write("ompagy: error: 'omp-manager' not found next to this script.\n")
     sys.exit(1)
+
+os.environ["OMP_PROG_NAME"] = "ompagy"
+os.environ["OMP_UPDATE_TARGET"] = omp_manager
+os.execv(sys.executable, [sys.executable, omp_manager] + sys.argv[1:])

@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""omp-manager - Antigravity quota dashboard for omp.
+"""omp-manager / ompagy - Antigravity quota dashboard for omp.
 
 Reads `omp usage --json`, merges duplicated shared meters, scores every
 account, and prints a ranked table:
 
     columns: Gemini 5h | Gemini 1w | Claude&GPT 5h | Claude&GPT 1w
-    cells:   usage bar + % used + time until reset
+    cells:   remaining bar + % left + time until reset
     rows:    every authenticated account, best -> worst
 
 Data-driven: accounts and meters are discovered from the report, so adding
 an account (or a new meter) later needs no code change.
+
+The script answers to two names: `omp-manager` and `ompagy`. It detects
+which one was invoked (argv[0], or the OMP_DEFAULT_PROG override) and
+adapts its program name, environment variable prefix and cache directory
+accordingly. Both names expose the exact same feature set.
 """
 
 from __future__ import annotations
@@ -21,7 +26,27 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
+
+__version__ = "1.2.0"
+GITHUB_REPO = "MinhBienK2/omp-manager"
+RAW_SCRIPT_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/omp-manager"
+VERSION_INFO_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/version.json"
+UPDATE_CHECK_INTERVAL = 3600  # seconds between background update checks
+UPDATE_RETRY_INTERVAL = 300  # seconds before retrying after a failed lookup
+UPDATE_TIMEOUT = 5.0  # seconds allowed for a network round trip
+
+# Which name should this run report itself as?
+#   1. OMP_DEFAULT_PROG  - explicit user override
+#   2. OMP_PROG_NAME     - set by the sibling wrapper script
+#   3. argv[0] basename  - "omp-manager" / "ompagy" / anything else
+_PROG_CANDIDATES = (os.environ.get("OMP_DEFAULT_PROG"), os.environ.get("OMP_PROG_NAME"))
+_INVOKED = os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else "omp-manager"
+PROG_NAME = next((c for c in _PROG_CANDIDATES if c in ("omp-manager", "ompagy")), None)
+if PROG_NAME is None:
+    PROG_NAME = _INVOKED if _INVOKED in ("omp-manager", "ompagy") else "omp-manager"
 
 PROVIDER = "google-antigravity"
 
@@ -32,6 +57,13 @@ BUCKET_TITLES = {
     "gemini-1w": "GEMINI 1W",
     "shared-5h": "C&G 5H",
     "shared-1w": "C&G 1W",
+}
+# Abbreviated titles for the narrow table tiers.
+BUCKET_TITLES_SHORT = {
+    "gemini-5h": "G5H",
+    "gemini-1w": "G1W",
+    "shared-5h": "C5H",
+    "shared-1w": "C1W",
 }
 # Ranking presets: how much each bucket moves the score (each sums to 1).
 # Gemini is the primary workload, so it carries the ranking by default.
@@ -47,6 +79,24 @@ RAW_WINDOWS = {"5h": "5h", "5-hour": "5h", "hour5": "5h", "rolling-5h": "5h",
                "weekly": "1w", "week": "1w", "1w": "1w", "7d": "1w",
                "daily": "daily", "day": "daily", "1d": "daily", "24h": "daily"}
 GRADES = [(90, "S", "fresh"), (75, "A", "ready"), (55, "B", "ok"), (35, "C", "tired"), (15, "D", "critical"), (-1, "F", "dead")]
+
+BAR = 6
+ACCT_MAX = 34
+PCT_W = 6  # width of the "  0.0%" percentage field
+
+# Table tiers, widest first. The renderer keeps the table and shrinks it until
+# it fits the terminal instead of falling back to a stacked layout.
+#   bar:   width of the quota bar      pct:  width of the percentage field
+#   reset: show the countdown column    acct: max width of the account column
+#   word:  show the grade word ("A · ready") next to the letter
+TIERS = {
+    "full":    {"bar": 6, "pct": 6, "reset": True,  "acct": 34, "word": True,  "titles": "long",  "num": True,  "score": True},
+    "compact": {"bar": 4, "pct": 5, "reset": True,  "acct": 22, "word": True,  "titles": "long",  "num": True,  "score": True},
+    "tight":   {"bar": 4, "pct": 5, "reset": False, "acct": 20, "word": False, "titles": "short", "num": True,  "score": True},
+    "micro":   {"bar": 3, "pct": 4, "reset": False, "acct": 15, "word": False, "titles": "short", "num": True,  "score": True},
+}
+TIER_ORDER = ["full", "compact", "tight", "micro"]
+ACCT_MIN = 12  # below this an email is unreadable
 
 
 # ----------------------------------------------------------------- terminal --
@@ -107,7 +157,7 @@ def remaining_color(ink: Ink, remaining_pct: float):
 def bar(ink: Ink, remaining_fraction: float, width: int, color) -> str:
     filled = int(round(remaining_fraction * width))
     filled = max(0, min(width, filled))
-    return color("█" * filled) + ink.grey("░" * (width - filled))
+    return color("█" * filled) + ink.grey("─" * (width - filled))
 
 
 # ------------------------------------------------------------------- helpers --
@@ -132,6 +182,87 @@ def fmt_delta(ms: float) -> str:
 
 def fmt_age(ms: float) -> str:
     return f"{fmt_delta(ms)} ago" if ms >= 0 else "just now"
+
+def fmt_token_num(n: float) -> str:
+    if n >= 1_000_000_000:
+        return f"{n/1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}k"
+    return str(int(n))
+
+
+def get_today_tokens_cached() -> dict:
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    sessions_dir = os.path.expanduser("~/.omp/agent/sessions")
+    cache_dir_path = cache_dir()
+    cache_file = os.path.join(cache_dir_path, "today_tokens.json")
+
+    cache = {}
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                cache = json.load(f)
+        except Exception:
+            pass
+
+    if cache.get("date") != today_str:
+        cache = {"date": today_str, "files": {}, "requests": 0, "in": 0, "out": 0, "total": 0}
+
+    cached_files = cache.get("files", {})
+    updated = False
+
+    if os.path.isdir(sessions_dir):
+        for root, dirs, files in os.walk(sessions_dir):
+            for f in files:
+                if f.endswith(".jsonl") and not f.startswith("__"):
+                    fp = os.path.join(root, f)
+                    try:
+                        mtime = os.path.getmtime(fp)
+                        if mtime < today_start:
+                            continue
+                        last_mtime = cached_files.get(fp, {}).get("mtime", 0)
+                        if mtime > last_mtime:
+                            fin = fout = freqs = 0
+                            with open(fp, "r", encoding="utf-8", errors="ignore") as file:
+                                for line in file:
+                                    if '"usage"' in line:
+                                        try:
+                                            obj = json.loads(line)
+                                            u = (obj.get("message") or {}).get("usage")
+                                            if u:
+                                                fin += u.get("input", 0) or 0
+                                                fout += u.get("output", 0) or 0
+                                                freqs += 1
+                                        except Exception:
+                                            pass
+                            cached_files[fp] = {"mtime": mtime, "in": fin, "out": fout, "reqs": freqs}
+                            updated = True
+                    except Exception:
+                        pass
+
+    tot_reqs = sum(v["reqs"] for v in cached_files.values())
+    tot_in = sum(v["in"] for v in cached_files.values())
+    tot_out = sum(v["out"] for v in cached_files.values())
+
+    cache["requests"] = tot_reqs
+    cache["in"] = tot_in
+    cache["out"] = tot_out
+    cache["total"] = tot_in + tot_out
+    cache["files"] = cached_files
+
+    if updated or not os.path.exists(cache_file):
+        try:
+            os.makedirs(cache_dir_path, exist_ok=True)
+            with open(cache_file, "w") as f:
+                json.dump(cache, f)
+        except Exception:
+            pass
+
+    return cache
 
 
 def classify(limit: dict) -> str | None:
@@ -209,9 +340,39 @@ def parse(payload: dict) -> list[dict]:
     return accounts
 
 
+def config_env(key: str, default: str | None = None) -> str | None:
+    """Read a setting from the environment, honouring both name prefixes.
+
+    The primary prefix follows the invoked program name, so `ompagy` prefers
+    `OMPAGY_*` and `omp-manager` prefers `OMP_MANAGER_*`. The other prefix is
+    always accepted as a fallback, which keeps old dotfiles working.
+    """
+    if PROG_NAME == "ompagy":
+        order = (f"OMPAGY_{key}", f"OMP_MANAGER_{key}")
+    else:
+        order = (f"OMP_MANAGER_{key}", f"OMPAGY_{key}")
+    for name in order:
+        val = os.environ.get(name)
+        if val is not None and val != "":
+            return val
+    return default
+
+
+def cache_dir() -> str:
+    """Cache directory for this program name, kept stable across renames."""
+    home = os.path.expanduser("~")
+    primary = os.path.join(home, ".cache", PROG_NAME)
+    other = os.path.join(home, ".cache", "omp-manager" if PROG_NAME == "ompagy" else "ompagy")
+    # Keep using an existing directory so upgrading does not lose cached data.
+    if os.path.isdir(other) and not os.path.isdir(primary):
+        return other
+    os.makedirs(primary, exist_ok=True)
+    return primary
+
+
 def resolve_weights(preset: str) -> tuple[dict, str]:
-    """OMP_MANAGER_WEIGHTS or OMPAGY_WEIGHTS (4 comma-separated numbers, BUCKETS order) wins."""
-    raw = os.environ.get("OMP_MANAGER_WEIGHTS") or os.environ.get("OMPAGY_WEIGHTS", "")
+    """Custom weights from the environment (4 comma-separated numbers) win."""
+    raw = config_env("WEIGHTS", "") or ""
     if raw.strip():
         try:
             parts = [float(x) for x in raw.split(",")]
@@ -222,7 +383,7 @@ def resolve_weights(preset: str) -> tuple[dict, str]:
                 raise ValueError
             return ({b: p / total for b, p in zip(BUCKETS, parts)}, "custom weights")
         except ValueError:
-            sys.stderr.write("omp-manager: ignoring bad weights environment variable, falling back to preset\n")
+            sys.stderr.write(f"{PROG_NAME}: ignoring bad weights env var, falling back to preset\n")
     return dict(PRESETS[preset]), preset
 
 
@@ -278,20 +439,61 @@ def fetch(args, ink: Ink) -> dict:
 
 
 def die(ink: Ink, message: str) -> None:
-    sys.stderr.write(ink.red("omp-manager: ") + message + "\n")
+    sys.stderr.write(ink.red(f"{PROG_NAME}: ") + message + "\n")
     raise SystemExit(1)
 
 
 # --------------------------------------------------------------------- render --
-def cell(ink: Ink, acc: dict, bucket: str, now_ms: float, width_bar: int) -> str:
+def fmt_reset(entry: dict | None, now_ms: float) -> str:
+    """Countdown text of a meter, or "-" when the window has no reset time."""
+    if not entry or not entry.get("resetsAt"):
+        return "-"
+    return fmt_delta(entry["resetsAt"] - now_ms)
+
+
+def reset_w(accounts: list[dict], now_ms: float) -> int:
+    """Width of the reset column: wide enough for the longest countdown.
+
+    Countdowns are variable length ("4h56m", "20h47m", "2d5h"), so the column
+    is measured instead of hardcoded - otherwise long values push the rest of
+    the row out of its box.
+    """
+    width = 5
+    for a in accounts:
+        for b in BUCKETS:
+            width = max(width, len(fmt_reset(a["buckets"].get(b), now_ms)))
+    return width
+
+
+def pct_decimals(accounts: list[dict], pct_w: int) -> int:
+    """How many decimals the percentage column can afford.
+
+    "100.0%" needs 6 columns, "97.5%" needs 5, "100%" needs 4. The column
+    keeps one decimal when it fits and falls back to whole percent when it
+    does not - a value must never spill out of its cell.
+    """
+    max_rem = 0.0
+    for a in accounts:
+        for b in BUCKETS:
+            e = a["buckets"].get(b)
+            if e:
+                max_rem = max(max_rem, e["remaining"])
+    needed = 6 if max_rem >= 99.95 else 5
+    return 1 if pct_w >= needed else 0
+
+
+def cell(ink: Ink, acc: dict, bucket: str, now_ms: float, width_bar: int,
+         rw: int, pct_w: int = PCT_W, decimals: int = 1) -> str:
     entry = acc["buckets"].get(bucket)
+    tail = ""
+    if rw:
+        tail = " " + ink.grey(fmt_reset(entry, now_ms).rjust(rw))
     if entry is None:
-        return ink.grey("·" * width_bar) + " " + ink.grey("  n/r ") + " " + ink.grey("  -  ")
-    remaining = entry["remaining"]
+        return (ink.grey("·" * width_bar) + " " + ink.grey("n/r".rjust(pct_w)) + tail)
+    remaining = max(0.0, min(100.0, entry["remaining"]))
     color = remaining_color(ink, remaining)
-    pct = f"{entry['used']:>5.1f}%"
-    reset = fmt_delta(entry["resetsAt"] - now_ms) if entry.get("resetsAt") else "-"
-    return f"{bar(ink, remaining / 100.0, width_bar, color)} {color(pct)} {ink.grey(f'{reset:>5}')}"
+    pct = f"{remaining:.{decimals}f}%".rjust(pct_w)   # remaining: bar and number agree
+    return f"{bar(ink, remaining / 100.0, width_bar, color)} {color(pct)}{tail}"
 
 
 def get_recoveries(accounts: list[dict], now_ms: float) -> list[dict]:
@@ -322,24 +524,76 @@ def get_recoveries(accounts: list[dict], now_ms: float) -> list[dict]:
     return recoveries
 
 
-BAR = 6
-ACCT_MAX = 34
-
-
-def short(email: str) -> str:
-    if len(email) <= ACCT_MAX:
+def short(email: str, max_len: int = ACCT_MAX) -> str:
+    """Shorten an email to `max_len` visible chars (never longer than that)."""
+    if len(email) <= max_len:
         return email
     local, _, domain = email.partition("@")
-    keep = ACCT_MAX - len(domain) - 2
-    return f"{local[:max(3, keep)]}…@{domain}" if domain else email[:ACCT_MAX]
+    if not domain:
+        return email[:max_len]
+    keep = max_len - len(domain) - 2      # room for "…@"
+    if keep < 3:                          # domain alone eats the space
+        return email[:max_len - 1] + "…"
+    return f"{local[:keep]}…@{domain}"
 
 
-def acct_w(accounts: list[dict]) -> int:
-    return max((len(short(a["email"])) for a in accounts), default=20)
+def acct_w(accounts: list[dict], max_len: int = ACCT_MAX) -> int:
+    return max((len(short(a["email"], max_len)) for a in accounts), default=20)
 
 
-def cell_w() -> int:
-    return BAR + 1 + 6 + 1 + 5
+def cell_w(lay: dict, rw: int) -> int:
+    return lay["bar"] + 1 + lay["pct"] + (1 + rw if lay["reset"] else 0)
+
+
+def table_width(accounts: list[dict], lay: dict, rw: int) -> int:
+    """Total width of the table, borders included."""
+    aw = acct_w(accounts, lay["acct"])
+    cw = cell_w(lay, rw)
+    grade_w = 9 if lay["word"] else 5
+    content = 4 * cw + aw + grade_w
+    if lay.get("num", True):
+        content += 2
+    if lay.get("score", True):
+        content += 5
+    ncols = 4 + 1 + 1 + int(lay.get("num", True)) + int(lay.get("score", True))
+    return content + 3 * (ncols - 1) + 4
+
+
+def choose_layout(accounts: list[dict], now_ms: float, term_w: int, force: str) -> str:
+    """Pick the widest table tier that fits the terminal.
+
+    A table is always returned: the table is the point of the tool, so it
+    shrinks (shorter bars, no countdown, shorter emails) rather than turning
+    into a stack of cards.
+    """
+    if force in TIERS:
+        return force
+    rw = reset_w(accounts, now_ms)
+    for name in TIER_ORDER:
+        if table_width(accounts, TIERS[name], rw) <= term_w:
+            return name
+    return TIER_ORDER[-1]
+
+
+def fit_layout(accounts: list[dict], now_ms: float, term_w: int, name: str) -> dict:
+    """Shrink the chosen tier further if it still does not fit.
+
+    Order of sacrifice: first the email column, then the bar, then the
+    decimals of the percentage. The table structure itself is never dropped.
+    """
+    lay = dict(TIERS[name])
+    rw = reset_w(accounts, now_ms) if lay["reset"] else 0
+    while table_width(accounts, lay, rw) > term_w and lay["acct"] > ACCT_MIN:
+        lay["acct"] -= 1
+    while table_width(accounts, lay, rw) > term_w and lay["bar"] > 2:
+        lay["bar"] -= 1
+    while table_width(accounts, lay, rw) > term_w and lay["pct"] > 4:
+        lay["pct"] -= 1
+    if table_width(accounts, lay, rw) > term_w and lay.get("num", True):
+        lay["num"] = False                       # drop the "#" column
+    if table_width(accounts, lay, rw) > term_w and lay.get("score", True):
+        lay["score"] = False                     # drop the SCORE column
+    return lay
 
 
 def accent_color(ink: Ink, acc: dict, text: str):
@@ -379,24 +633,37 @@ def fmt_stamp(ms: float) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
 
 
-def render_table(ink: Ink, accounts: list[dict], now_ms: float, narrow: bool) -> str:
+def render_table(ink: Ink, accounts: list[dict], now_ms: float, narrow: bool,
+                 lay: dict | None = None) -> str:
     rows = []
-    aw = acct_w(accounts)
-    cw = cell_w()
-    head_cols = [
-        ("#", 2),
+    lay = lay or TIERS["full"]
+    bar_w = lay["bar"]
+    pct_w = lay["pct"]
+    aw = acct_w(accounts, lay["acct"])
+    rw = reset_w(accounts, now_ms) if lay["reset"] else 0
+    cw = cell_w(lay, rw)
+    dec = pct_decimals(accounts, lay["pct"])
+    grade_w = 9 if lay["word"] else 5
+    titles = BUCKET_TITLES if lay["titles"] == "long" else BUCKET_TITLES_SHORT
+    show_num = lay.get("num", True)
+    show_score = lay.get("score", True)
+    head_cols = []
+    if show_num:
+        head_cols.append(("#", 2))
+    head_cols += [
         ("ACCOUNT", aw),
-        (BUCKET_TITLES["gemini-5h"], cw),
-        (BUCKET_TITLES["gemini-1w"], cw),
-        (BUCKET_TITLES["shared-5h"], cw),
-        (BUCKET_TITLES["shared-1w"], cw),
-        ("SCORE", 5),
-        ("GRADE", 9),
+        (titles["gemini-5h"], cw),
+        (titles["gemini-1w"], cw),
+        (titles["shared-5h"], cw),
+        (titles["shared-1w"], cw),
     ]
+    if show_score:
+        head_cols.append(("SCORE", 5))
+    head_cols.append(("GRADE", grade_w))
 
     if not narrow:
         top = ink.grey("╭─" + "─┬─".join("─" * w for _, w in head_cols) + "─╮")
-        hdr = ink.grey("│ ") + ink.grey(" │ ").join(ink.bold(pad(title, w)) for title, w in head_cols) + ink.grey(" │")
+        hdr = ink.grey("│ ") + ink.grey(" │ ").join(ink.bold(pad(title[:w], w)) for title, w in head_cols) + ink.grey(" │")
         mid = ink.grey("├─" + "─┼─".join("─" * w for _, w in head_cols) + "─┤")
         bot = ink.grey("╰─" + "─┴─".join("─" * w for _, w in head_cols) + "─╯")
 
@@ -407,41 +674,47 @@ def render_table(ink: Ink, accounts: list[dict], now_ms: float, narrow: bool) ->
         for idx, acc in enumerate(accounts, 1):
             letter, word = grade(acc["score"])
             score_val = f"{acc['score']:>5.1f}"
-            grade_val = f"{letter} · {word}"
-            c_vals = [
-                f"{idx:>2}",
-                accent_color(ink, acc, short(acc["email"])),
-                cell(ink, acc, "gemini-5h", now_ms, BAR),
-                cell(ink, acc, "gemini-1w", now_ms, BAR),
-                cell(ink, acc, "shared-5h", now_ms, BAR),
-                cell(ink, acc, "shared-1w", now_ms, BAR),
-                ink.bold(score_val),
-                ink.cyan(grade_val) if letter in ("S", "A") else (ink.yellow(grade_val) if letter in ("B", "C") else ink.red(grade_val)),
+            grade_val = f"{letter} · {word}" if lay["word"] else letter
+            c_vals = []
+            if show_num:
+                c_vals.append(f"{idx:>2}")
+            c_vals += [
+                accent_color(ink, acc, short(acc["email"], lay["acct"])),
+                cell(ink, acc, "gemini-5h", now_ms, bar_w, rw, pct_w, dec),
+                cell(ink, acc, "gemini-1w", now_ms, bar_w, rw, pct_w, dec),
+                cell(ink, acc, "shared-5h", now_ms, bar_w, rw, pct_w, dec),
+                cell(ink, acc, "shared-1w", now_ms, bar_w, rw, pct_w, dec),
             ]
+            if show_score:
+                c_vals.append(ink.bold(score_val))
+            c_vals.append(
+                ink.cyan(grade_val) if letter in ("S", "A") else (ink.yellow(grade_val) if letter in ("B", "C") else ink.red(grade_val))
+            )
             row_str = ink.grey("│ ") + ink.grey(" │ ").join(pad(v, w) for v, (_, w) in zip(c_vals, head_cols)) + ink.grey(" │")
             rows.append(row_str)
 
         rows.append(bot)
     else:
+        card_w = 72
+        left_w = 32
+        right_w = card_w - 7 - left_w   # 33
         for idx, acc in enumerate(accounts, 1):
             letter, word = grade(acc["score"])
             title = f" {idx}. {short(acc['email'])} "
             score_tag = f" {acc['score']:>5.1f} · {letter} · {word} "
-            card_w = 72
-            dashes = card_w - 4 - len(title) - len(score_tag)
-            dashes = max(2, dashes)
+            dashes = max(2, card_w - 4 - len(title) - len(score_tag))
             top = ink.grey("╭─") + ink.bold(accent_color(ink, acc, title)) + ink.grey("─" * dashes) + ink.cyan(score_tag) + ink.grey("─╮")
-            bot = ink.grey("╰" + "─" * 34 + "┴" + "─" * 35 + "╯")
+            bot = ink.grey("╰" + "─" * (left_w + 2) + "┴" + "─" * (right_w + 2) + "╯")
 
-            row1 = (ink.grey("│ ") + pad(f"{BUCKET_TITLES['gemini-5h']} " + cell(ink, acc, "gemini-5h", now_ms, BAR), 32) +
-                    ink.grey(" │ ") + pad(f"{BUCKET_TITLES['shared-5h']} " + cell(ink, acc, "shared-5h", now_ms, BAR), 33) + ink.grey(" │"))
-            row2 = (ink.grey("│ ") + pad(f"{BUCKET_TITLES['gemini-1w']} " + cell(ink, acc, "gemini-1w", now_ms, BAR), 32) +
-                    ink.grey(" │ ") + pad(f"{BUCKET_TITLES['shared-1w']} " + cell(ink, acc, "shared-1w", now_ms, BAR), 33) + ink.grey(" │"))
+            row1 = (ink.grey("│ ") + pad(f"{BUCKET_TITLES['gemini-5h']} " + cell(ink, acc, "gemini-5h", now_ms, bar_w, rw, pct_w, dec), left_w) +
+                    ink.grey(" │ ") + pad(f"{BUCKET_TITLES['shared-5h']} " + cell(ink, acc, "shared-5h", now_ms, bar_w, rw, pct_w, dec), right_w) + ink.grey(" │"))
+            row2 = (ink.grey("│ ") + pad(f"{BUCKET_TITLES['gemini-1w']} " + cell(ink, acc, "gemini-1w", now_ms, bar_w, rw, pct_w, dec), left_w) +
+                    ink.grey(" │ ") + pad(f"{BUCKET_TITLES['shared-1w']} " + cell(ink, acc, "shared-1w", now_ms, bar_w, rw, pct_w, dec), right_w) + ink.grey(" │"))
             rows.extend([top, row1, row2, bot, ""])
     return "\n".join(rows)
 
 
-def render_card(ink: Ink, payload: dict, accounts: list[dict], now_ms: float, narrow: bool, stale: bool, freshest: float, generated: float) -> list[str]:
+def render_card(ink: Ink, payload: dict, accounts: list[dict], now_ms: float, narrow: bool, stale: bool, freshest: float, generated: float, term_w: int | None = None) -> list[str]:
     lines = []
     recoveries = get_recoveries(accounts, now_ms)
     cap = (payload.get("capacity") or {}).get(PROVIDER) or []
@@ -461,77 +734,102 @@ def render_card(ink: Ink, payload: dict, accounts: list[dict], now_ms: float, na
     gem = best_for("gemini")
     claude = best_for("shared")
 
+    # Bucket summary, shared by every card style.
+    bucket_lines = []
+    for b in BUCKETS:
+        entries = [a["buckets"].get(b) for a in accounts]
+        reported = [e for e in entries if e]
+        free_pct = (sum(100.0 - e["used"] for e in reported) / len(reported)) if reported else 100.0
+        free_cnt = len([a for a, e in zip(accounts, entries) if not e or e["remaining"] > 0])
+        bucket_lines.append((b, free_pct, free_cnt))
+
+    right_lines = []
+    gem_str = ink.green(short(gem["email"])) if gem else ink.red("none")
+    claude_str = ink.green(short(claude["email"])) if claude else ink.red("none")
+    right_lines.append(f"★ Best Gemini : {gem_str}")
+    right_lines.append(f"★ Best Claude : {claude_str}")
+    if recoveries:
+        r0 = recoveries[0]
+        right_lines.append(f"⚡ Next relief : {ink.cyan(r0['email'].split('@')[0])} (+{r0['recover_pct']:.0f}% {r0['bucket']} in {fmt_delta(r0['delta'])})")
+    else:
+        right_lines.append("⚡ Next relief : All quotas 100% full")
+    right_lines.append(f"⟳ Pool Cap    : {ink.grey(cap_str if cap_str else 'N/A')}")
+
     if not narrow:
-        card_w = 98
+        left_lines = []
+        for b, free_pct, free_cnt in bucket_lines:
+            bar_str = bar(ink, max(0.0, min(100.0, free_pct)) / 100.0, 10, remaining_color(ink, free_pct))
+            left_lines.append(f"{BUCKET_TITLES[b]:<9} {bar_str} {free_pct:>5.1f}% ({free_cnt}/{len(accounts)} ready)")
+
+        # Column widths are measured, not guessed: a long email or a long
+        # countdown must never push a row outside the box.
+        lw = max(_display_len(t) for t in left_lines)
+        rw = max(_display_len(t) for t in right_lines)
+        card_w = lw + rw + 7
+
+        if term_w is not None and card_w > term_w:
+            # Slim card for narrow terminals: no frame, no two-column split.
+            snap_text = f" snapshot {fmt_age(freshest)}" if not stale else " STALE - rerun with --refresh"
+            lines.append(ink.bold(ink.cyan(f"ANTIGRAVITY QUOTA · {len(accounts)} accounts"))
+                         + (ink.yellow(snap_text) if stale else ink.grey(snap_text)))
+            lines.extend(left_lines)
+            lines.extend(right_lines)
+            return lines
+
         header_title = f" ANTIGRAVITY QUOTA · {len(accounts)} accounts "
         snap_text = f" snapshot {fmt_age(freshest)} " if not stale else " STALE - rerun with --refresh "
-        mid_dashes = card_w - 2 - len(header_title) - len(snap_text)
-        mid_dashes = max(2, mid_dashes)
+        mid_dashes = max(2, card_w - 4 - len(header_title) - len(snap_text))
         snap_colored = ink.yellow(snap_text) if stale else ink.grey(snap_text)
         top_line = ink.grey("╭─") + ink.bold(ink.cyan(header_title)) + ink.grey("─" * mid_dashes) + snap_colored + ink.grey("─╮")
         lines.append(top_line)
 
-        left_lines = []
-        for b in BUCKETS:
-            entries = [a["buckets"].get(b) for a in accounts]
-            reported = [e for e in entries if e]
-            used_pct = (sum(e["used"] for e in reported) / len(reported)) if reported else 0.0
-            free_cnt = len([a for a, e in zip(accounts, entries) if not e or e["remaining"] > 0])
-            bar_str = bar(ink, max(0.0, 100.0 - used_pct) / 100.0, 10, remaining_color(ink, 100 - used_pct))
-            left_lines.append(f"{BUCKET_TITLES[b]:<9} {bar_str} {used_pct:>5.1f}% ({free_cnt}/{len(accounts)} ready)")
-
-        right_lines = []
-        gem_str = ink.green(short(gem["email"])) if gem else ink.red("none")
-        claude_str = ink.green(short(claude["email"])) if claude else ink.red("none")
-        right_lines.append(f"★ Best Gemini : {gem_str}")
-        right_lines.append(f"★ Best Claude : {claude_str}")
-
-        if recoveries:
-            r0 = recoveries[0]
-            right_lines.append(f"⚡ Next relief : {ink.cyan(r0['email'].split('@')[0])} (+{r0['recover_pct']:.0f}% {r0['bucket']} in {fmt_delta(r0['delta'])})")
-        else:
-            right_lines.append("⚡ Next relief : All quotas 100% full")
-
-        right_lines.append(f"⟳ Pool Cap    : {ink.grey(cap_str if cap_str else 'N/A')}")
-
-        lw = 46
-        rw = 48
         div = ink.grey(" │ ")
         border_l = ink.grey("│ ")
         border_r = ink.grey(" │")
         for l_txt, r_txt in zip(left_lines, right_lines):
             lines.append(border_l + pad(l_txt, lw) + div + pad(r_txt, rw) + border_r)
 
-        lines.append(ink.grey("╰" + "─" * (lw + 2) + "┴" + "─" * (rw + 2) + "╯"))
+        today_data = get_today_tokens_cached()
+        reqs_str = f"{today_data.get('requests', 0):,}"
+        in_str = fmt_token_num(today_data.get('in', 0))
+        out_str = fmt_token_num(today_data.get('out', 0))
+        tot_str = fmt_token_num(today_data.get('total', 0))
+
+        lines.append(ink.grey("├" + "─" * (lw + 2) + "┴" + "─" * (rw + 2) + "┤"))
+        today_text = f"⚡ TODAY USAGE : {ink.bold(reqs_str)} reqs  ·  In: {ink.cyan(in_str)}  ·  Out: {ink.green(out_str)}  ·  Total: {ink.bold(ink.yellow(tot_str))} tokens"
+        inner_w = lw + rw + 3
+        lines.append(border_l + pad(today_text, inner_w) + border_r)
+        lines.append(ink.grey("╰" + "─" * (inner_w + 2) + "╯"))
     else:
         card_w = 72
         header_title = f" ANTIGRAVITY QUOTA · {len(accounts)} accounts "
         snap_text = f" {fmt_age(freshest)} " if not stale else " STALE "
-        dashes = card_w - 2 - len(header_title) - len(snap_text)
-        dashes = max(2, dashes)
+        dashes = max(2, card_w - 4 - len(header_title) - len(snap_text))
         snap_colored = ink.yellow(snap_text) if stale else ink.grey(snap_text)
         top_line = ink.grey("╭─") + ink.bold(ink.cyan(header_title)) + ink.grey("─" * dashes) + snap_colored + ink.grey("─╮")
         lines.append(top_line)
 
-        for b in BUCKETS:
-            entries = [a["buckets"].get(b) for a in accounts]
-            reported = [e for e in entries if e]
-            used_pct = (sum(e["used"] for e in reported) / len(reported)) if reported else 0.0
-            free_cnt = len([a for a, e in zip(accounts, entries) if not e or e["remaining"] > 0])
-            bar_str = bar(ink, max(0.0, 100.0 - used_pct) / 100.0, 12, remaining_color(ink, 100 - used_pct))
-            content = f" {BUCKET_TITLES[b]:<9} {bar_str} {used_pct:>5.1f}% ({free_cnt}/{len(accounts)} ready)"
+        for b, free_pct, free_cnt in bucket_lines:
+            bar_str = bar(ink, max(0.0, min(100.0, free_pct)) / 100.0, 12, remaining_color(ink, free_pct))
+            content = f" {BUCKET_TITLES[b]:<9} {bar_str} {free_pct:>5.1f}% ({free_cnt}/{len(accounts)} ready)"
             lines.append(ink.grey("│") + pad(content, card_w - 2) + ink.grey("│"))
 
         lines.append(ink.grey("├" + "─" * (card_w - 2) + "┤"))
 
-        gem_str = ink.green(short(gem["email"])) if gem else ink.red("none")
-        claude_str = ink.green(short(claude["email"])) if claude else ink.red("none")
         lines.append(ink.grey("│") + pad(f" ★ Best Gemini : {gem_str}", card_w - 2) + ink.grey("│"))
         lines.append(ink.grey("│") + pad(f" ★ Best Claude : {claude_str}", card_w - 2) + ink.grey("│"))
         if recoveries:
             r0 = recoveries[0]
             lines.append(ink.grey("│") + pad(f" ⚡ Next relief : {ink.cyan(r0['email'].split('@')[0])} (+{r0['recover_pct']:.0f}% {r0['bucket']} in {fmt_delta(r0['delta'])})", card_w - 2) + ink.grey("│"))
+        today_data = get_today_tokens_cached()
+        reqs_str = f"{today_data.get('requests', 0):,}"
+        in_str = fmt_token_num(today_data.get('in', 0))
+        out_str = fmt_token_num(today_data.get('out', 0))
+        tot_str = fmt_token_num(today_data.get('total', 0))
         lines.append(ink.grey("│") + pad(f" ⟳ Pool Cap    : {ink.grey(cap_str if cap_str else 'N/A')}", card_w - 2) + ink.grey("│"))
+        lines.append(ink.grey("├" + "─" * (card_w - 2) + "┤"))
+        today_text = f" ⚡ TODAY USAGE : {ink.bold(reqs_str)} reqs · In: {ink.cyan(in_str)} · Out: {ink.green(out_str)} · Total: {ink.bold(ink.yellow(tot_str))}"
+        lines.append(ink.grey("│") + pad(today_text, card_w - 2) + ink.grey("│"))
         lines.append(ink.grey("╰" + "─" * (card_w - 2) + "╯"))
 
     return lines
@@ -561,6 +859,8 @@ def render_mini(ink: Ink, payload: dict, accounts: list[dict], now_ms: float) ->
     if recoveries:
         r0 = recoveries[0]
         parts.append(f"Next: {ink.cyan(r0['email'].split('@')[0])} (+{r0['recover_pct']:.0f}% in {fmt_delta(r0['delta'])})")
+    today_data = get_today_tokens_cached()
+    parts.append(f"Today: {fmt_token_num(today_data.get('requests', 0))} reqs, {fmt_token_num(today_data.get('total', 0))} tok")
     return " · ".join(parts)
 
 
@@ -572,13 +872,21 @@ def render(ink: Ink, payload: dict, accounts: list[dict], args, weights: dict, p
     oldest = max(ages) if ages else 0
     stale = oldest > args.stale * 1000
 
-    head_cols_len = 2 + acct_w(accounts) + (cell_w() * 4) + 5 + 9 + 3 * 7 + 4
-    is_narrow = args.narrow or term_width() < head_cols_len
+    term_w = term_width()
+    stacked = args.narrow or args.layout == "stack"
+    if stacked:
+        is_narrow = True
+        lay = TIERS["full"]
+    else:
+        is_narrow = False
+        name = choose_layout(accounts, now_ms, term_w, args.layout)
+        lay = fit_layout(accounts, now_ms, term_w, name)
 
-    out = render_card(ink, payload, accounts, now_ms, narrow=is_narrow, stale=stale, freshest=freshest, generated=generated)
+    out = render_card(ink, payload, accounts, now_ms, narrow=is_narrow, stale=stale,
+                      freshest=freshest, generated=generated, term_w=term_w)
     out.append("")
     out.append(ink.bold("RANKING  " + ink.grey(f"(best -> worst · ranked by {preset})")))
-    out.append(render_table(ink, accounts, now_ms, narrow=is_narrow))
+    out.append(render_table(ink, accounts, now_ms, narrow=is_narrow, lay=lay))
     out.append("")
 
     extras = [(a["email"], e) for a in accounts for e in a["extra"]]
@@ -587,7 +895,7 @@ def render(ink: Ink, payload: dict, accounts: list[dict], args, weights: dict, p
         for email, e in extras:
             reset = f"reset {fmt_delta(e['resetsAt'] - now_ms)}" if e.get("resetsAt") else ""
             left_pct = 100 - e["used"]
-            out.append(f"  {pad(email, acct_w(accounts))}  {pad(e['label'], 16)} "
+            out.append(f"  {pad(short(email, lay['acct']), lay['acct'])}  {pad(e['label'], 16)} "
                        f"{ink.grey(f'{left_pct:>5.1f}% left · {reset}')}")
         out.append("")
     for name in ("accountsWithoutUsage", "disabledCredentials"):
@@ -598,10 +906,23 @@ def render(ink: Ink, payload: dict, accounts: list[dict], args, weights: dict, p
                 out.append("  " + (r if isinstance(r, str) else json.dumps(r))[:120])
             out.append("")
 
-    out.append(ink.grey(f"score weights ({preset}): "
-                        + "  ".join(f"{BUCKET_TITLES[b]} {weights[b]:.2f}" for b in BUCKETS)
-                        + " · n/r = window not reported (counted as fresh)"
-                        + " · switch with --by gemini|balanced|claude"))
+    short_titles = BUCKET_TITLES_SHORT if lay["titles"] == "short" else BUCKET_TITLES
+    grades_txt = " ".join(f"{letter}≥{thr}" for thr, letter, _ in GRADES[:-1]) + " F<15"
+    if term_w >= 170:
+        out.append(ink.grey(f"bar & % = quota remaining  ·  grade: {grades_txt}"))
+        out.append(ink.grey(f"score weights ({preset}): "
+                            + "  ".join(f"{BUCKET_TITLES[b]} {weights[b]:.2f}" for b in BUCKETS)
+                            + " · n/r = window not reported (counted as fresh)"
+                            + " · switch with --by gemini|balanced|claude"))
+    elif term_w >= 80:
+        out.append(ink.grey(f"bar & % = quota remaining  ·  grade: {grades_txt}"))
+        out.append(ink.grey(f"weights ({preset}): "
+                            + " ".join(f"{short_titles[b]} {weights[b]:.2f}" for b in BUCKETS)
+                            + " · n/r = not reported"))
+    else:
+        out.append(ink.grey(f"bar & % = remaining · {grades_txt}"))
+        out.append(ink.grey(f"weights: "
+                            + " ".join(f"{short_titles[b]} {weights[b]:.2f}" for b in BUCKETS)))
     return "\n".join(out)
 
 def term_width() -> int:
@@ -611,26 +932,218 @@ def term_width() -> int:
     return shutil.get_terminal_size((120, 24)).columns
 
 
+# --------------------------------------------------------------- self update --
+def parse_version(v: str) -> tuple[int, ...]:
+    """Turn 'v1.2.3' into (1, 2, 3) so versions can be compared numerically."""
+    parts = []
+    for chunk in v.strip().lstrip("vV").split("."):
+        digits = ""
+        for ch in chunk:
+            if not ch.isdigit():
+                break
+            digits += ch
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def is_newer(remote: str, local: str) -> bool:
+    return parse_version(remote) > parse_version(local)
+
+
+def current_script_path() -> str:
+    """Absolute path of the file that should be replaced by an update.
+
+    `OMP_UPDATE_TARGET` wins when set: the `ompagy` wrapper uses it to point
+    at `omp-manager`, so updating never overwrites the wrapper itself.
+    """
+    override = os.environ.get("OMP_UPDATE_TARGET")
+    if override and os.path.isfile(override):
+        return os.path.realpath(override)
+    path = sys.argv[0]
+    if not os.path.isabs(path):
+        found = shutil.which(path)
+        path = found if found else os.path.abspath(path)
+    return os.path.realpath(path)
+
+
+def _http_get(url: str, timeout: float) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": f"omp-manager/{__version__}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def remote_version(force: bool = False) -> tuple[str, str]:
+    """Return (version, notes) published on GitHub.
+
+    The answer is cached for an hour so a normal run never pays for a network
+    round trip more than once per hour. A failed lookup is remembered for a
+    much shorter time, so a machine that was offline retries soon after
+    coming back online instead of waiting a full hour.
+    """
+    cache_file = os.path.join(cache_dir(), "update_check.json")
+    now = time.time()
+    if not force:
+        try:
+            with open(cache_file, "r") as f:
+                cached = json.load(f)
+            age = now - cached.get("checkedAt", 0)
+            ttl = UPDATE_CHECK_INTERVAL if cached.get("ok") else UPDATE_RETRY_INTERVAL
+            if age < ttl:
+                return cached.get("version", __version__), cached.get("notes", "")
+        except Exception:
+            pass
+
+    version, notes, ok = __version__, "", False
+    try:
+        data = json.loads(_http_get(VERSION_INFO_URL, UPDATE_TIMEOUT).decode("utf-8"))
+        version = str(data.get("version") or __version__)
+        notes = str(data.get("description") or "")
+        ok = True
+    except Exception:
+        pass
+    try:
+        with open(cache_file, "w") as f:
+            json.dump({"checkedAt": now, "version": version, "notes": notes, "ok": ok}, f)
+    except Exception:
+        pass
+    return version, notes
+
+
+def try_git_pull(target: str) -> bool:
+    """If the script lives inside a git checkout, update it with git.
+
+    A git checkout keeps the full history, so `git pull --ff-only` is both
+    faster and safer than downloading a single file. The pull follows the
+    upstream of the current branch, so a checkout on a feature branch is not
+    silently fast-forwarded onto main.
+    """
+    repo_dir = os.path.dirname(target)
+    if not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return False
+    try:
+        proc = subprocess.run(["git", "-C", repo_dir, "pull", "--ff-only"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=30, check=False)
+    except Exception:
+        return False
+    return proc.returncode == 0
+
+
+def self_update(ink: Ink, version: str, notes: str = "") -> str:
+    """Update this script to the newest published version.
+
+    `version` is the version the caller already learned about; it is not
+    fetched again here. Returns "updated", "current" or "failed".
+    """
+    target = current_script_path()
+    if not is_newer(version, __version__):
+        sys.stderr.write(ink.green(f"✓ [{PROG_NAME}] Already up to date (v{__version__}).\n"))
+        return "current"
+
+    # A git checkout is updated in place, which keeps the whole repo in sync.
+    if try_git_pull(target):
+        sys.stderr.write(ink.green(f"✓ [{PROG_NAME}] Updated via git pull (v{version})\n"))
+        return "updated"
+
+    try:
+        payload = _http_get(RAW_SCRIPT_URL, UPDATE_TIMEOUT * 3)
+    except Exception as e:
+        sys.stderr.write(ink.red(f"✗ [{PROG_NAME}] Could not download update: {e}\n"))
+        return "failed"
+
+    text = payload.decode("utf-8", "replace")
+    try:
+        compile(text, target, "exec")  # never install a script that does not parse
+    except SyntaxError as e:
+        sys.stderr.write(ink.red(f"✗ [{PROG_NAME}] Downloaded file is not valid Python: {e}\n"))
+        return "failed"
+
+    if not os.access(target, os.W_OK):
+        sys.stderr.write(ink.yellow(f"⚠ [{PROG_NAME}] No write permission for {target}.\n")
+                         + ink.yellow(f"  Update manually: sudo {PROG_NAME} --update\n"))
+        return "failed"
+
+    tmp = f"{target}.update.{os.getpid()}"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(payload)
+        os.chmod(tmp, os.stat(target).st_mode & 0o7777 or 0o755)
+        os.replace(tmp, target)
+    except Exception as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        sys.stderr.write(ink.red(f"✗ [{PROG_NAME}] Update failed: {e}\n"))
+        return "failed"
+
+    sys.stderr.write(ink.green(f"✓ [{PROG_NAME}] Updated v{__version__} → v{version}") +
+                     (f" ({notes})\n" if notes else "\n"))
+    return "updated"
+
+
+def maybe_auto_update(ink: Ink) -> bool:
+    """Background update check. Returns True when the script was replaced."""
+    version, notes = remote_version()
+    if not is_newer(version, __version__):
+        return False
+    target = current_script_path()
+    if not os.access(target, os.W_OK):
+        sys.stderr.write(ink.yellow(f"⚡ [{PROG_NAME}] v{version} is available ({notes}). "
+                                    f"Run: sudo {PROG_NAME} --update\n"))
+        return False
+    sys.stderr.write(ink.cyan(f"⚡ [{PROG_NAME}] v{version} available ({notes}). Updating...\n"))
+    if self_update(ink, version, notes) != "updated":
+        return False
+    # Re-exec so the user immediately sees the new version. The absolute path
+    # is used (argv[0] may be a bare name that only resolves through PATH) and
+    # the identity is pinned so the new process reports the same program name.
+    os.environ["OMP_PROG_NAME"] = PROG_NAME
+    os.execv(sys.executable, [sys.executable, target] + sys.argv[1:])
+    return True  # unreachable, execv does not return
+
+
 # ----------------------------------------------------------------------- main --
 def main() -> None:
-    ap = argparse.ArgumentParser(prog="omp-manager", description="Ranked Antigravity quota dashboard for omp")
+    ap = argparse.ArgumentParser(
+        prog=PROG_NAME,
+        description=f"{PROG_NAME} - Ranked Antigravity quota dashboard & multi-account manager for omp")
+    ap.add_argument("--version", "-v", action="version", version=f"{PROG_NAME} {__version__}")
     ap.add_argument("--refresh", action="store_true", help="invalidate omp's cache before reading")
     ap.add_argument("--input", metavar="FILE", help="render a saved `omp usage --json` snapshot instead of fetching")
-    ap.add_argument("--profile", default=os.environ.get("OMP_MANAGER_PROFILE") or os.environ.get("OMPAGY_PROFILE"), help="omp profile to query")
-    ap.add_argument("--by", choices=sorted(PRESETS), default=os.environ.get("OMP_MANAGER_BY") or os.environ.get("OMPAGY_BY", DEFAULT_PRESET),
+    ap.add_argument("--profile", default=config_env("PROFILE"), help="omp profile to query")
+    ap.add_argument("--by", choices=sorted(PRESETS), default=config_env("BY", DEFAULT_PRESET),
                     help="what the score is weighted toward (default: gemini)")
     ap.add_argument("--sort", choices=["score", "reset", "name"], default="score",
                     help="ranking key (default: score)")
-    ap.add_argument("--narrow", action="store_true", help="force stacked layout")
+    ap.add_argument("--narrow", action="store_true", help="force stacked layout (same as --layout stack)")
+    ap.add_argument("--layout", choices=["auto"] + TIER_ORDER + ["stack"], default="auto",
+                    help="table density: auto shrinks the table to fit the terminal, "
+                         "stack = one card per account (default: auto)")
     ap.add_argument("--mini", "-1", action="store_true", help="output a single-line summary (for tmux/prompt)")
     ap.add_argument("--json", action="store_true", help="emit the computed model as JSON")
     ap.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     ap.add_argument("--stale", type=float, default=900, metavar="SEC",
                     help="warn when the oldest snapshot is older than this (default 900)")
     ap.add_argument("--timeout", type=float, default=180)
+    ap.add_argument("--update", action="store_true", help="check GitHub and install the newest version now")
+    ap.add_argument("--no-update", action="store_true",
+                    default=config_env("NO_UPDATE") is not None,
+                    help="skip the background update check")
     args = ap.parse_args()
 
     ink = Ink(supports_color(args.color))
+
+    if args.update:
+        version, notes = remote_version(force=True)
+        status = self_update(ink, version, notes)
+        sys.exit(0 if status in ("updated", "current") else 1)
+
+    # Background update check: skipped for machine-readable output so a
+    # statusline or a cron job never blocks on the network.
+    if not args.no_update and not args.mini and not args.json and not args.input:
+        maybe_auto_update(ink)
+
     payload = fetch(args, ink)
     accounts = parse(payload)
     if not accounts:
@@ -690,6 +1203,7 @@ def main() -> None:
             "accounts": out,
             "recoveries": rec_list,
             "capacity": (payload.get("capacity") or {}).get(PROVIDER, []),
+            "today": get_today_tokens_cached(),
         }, indent=2))
         return
     print(render(ink, payload, accounts, args, weights, preset))
