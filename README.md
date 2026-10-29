@@ -273,7 +273,22 @@ Khi bạn muốn đẩy bản mới lên GitHub (để mọi máy người dùng
 ./release.sh 1.3.0 "Thêm bộ lọc theo profile"
 ```
 
-Script sẽ bump `__version__` trong `omp-manager`, cập nhật `version.json`, chạy test, commit, push và tạo tag `v1.3.0`.
+Script sẽ bump `__version__` trong `omp-manager`, cập nhật `version.json`, chạy test, commit, push lên `main` và tạo tag `v1.3.0`.
+
+> **Luôn phát hành từ `main`.** Client đọc `version.json` từ `main` để biết có bản mới. Nếu `version.json` nằm trên một nhánh khác thì không ai nhận được thông báo cập nhật — tính năng auto-update chết âm thầm. `release.sh` đã tự chuyển về `main` và pull trước khi phát hành để tránh lỗi này.
+
+### Nhánh nào được bảo vệ?
+
+Repo hiện **chưa** bật branch protection, nghĩa là collaborator có `push` quyền đẩy thẳng vào `main`. Bật protection cần quyền `admin` (owner của repo).
+
+Để bật (Settings → Branches → Add rule hoặc Rulesets):
+
+- Branch name pattern: `main`
+- Require a pull request before merging → **1 approving review**
+- Require status checks to pass → chọn job `CI / Quality Assurance`
+- Block force pushes và branch deletion
+
+Cách này giữ cho `main` luôn có `version.json` đúng, nên auto-update không bị hỏng do ai đó push thẳng.
 
 ---
 
