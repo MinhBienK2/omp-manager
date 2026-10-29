@@ -1,0 +1,52 @@
+name: CI / Quality Assurance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Bytecode compilation check
+        run: |
+          python3 -m py_compile omp-manager ompagy examples/make_sample.py tests/*.py
+
+      - name: Shell script syntax check
+        run: |
+          bash -n install.sh
+          bash -n release.sh
+
+      - name: Run unit test suite
+        run: |
+          python3 -m unittest discover -s tests -v
+
+      - name: CLI Smoke Test (Offline Sample)
+        run: |
+          chmod +x omp-manager ompagy
+          ./omp-manager --version
+          ./ompagy --version
+          ./omp-manager --input examples/sample-usage.json
+          ./omp-manager --input examples/sample-usage.json --mini
+          ./omp-manager --input examples/sample-usage.json --json | python3 -m json.tool > /dev/null
+          ./omp-manager --input examples/sample-usage.json --layout tight
+          ./omp-manager --input examples/sample-usage.json --layout micro
+          ./omp-manager --input examples/sample-usage.json --layout stack
+          ./ompagy --input examples/sample-usage.json
