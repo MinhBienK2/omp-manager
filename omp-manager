@@ -1013,13 +1013,15 @@ def try_git_pull(target: str) -> bool:
     """If the script lives inside a git checkout, update it with git.
 
     A git checkout keeps the full history, so `git pull --ff-only` is both
-    faster and safer than downloading a single file.
+    faster and safer than downloading a single file. The pull follows the
+    upstream of the current branch, so a checkout on a feature branch is not
+    silently fast-forwarded onto main.
     """
     repo_dir = os.path.dirname(target)
     if not os.path.isdir(os.path.join(repo_dir, ".git")):
         return False
     try:
-        proc = subprocess.run(["git", "-C", repo_dir, "pull", "--ff-only", "origin", "main"],
+        proc = subprocess.run(["git", "-C", repo_dir, "pull", "--ff-only"],
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               timeout=30, check=False)
     except Exception:
