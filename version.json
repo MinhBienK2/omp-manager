@@ -1,5 +1,5 @@
 {
-  "version": "1.2.0",
-  "updatedAt": "2026-10-29",
-  "description": "Adaptive responsive tiers, token usage stats, dual-identity CLI, and self-updater"
+  "version": "1.3.0",
+  "updatedAt": "2026-11-03",
+  "description": "TUI tối giản: bỏ score/grade/pool-cap, sửa lệch unicode width, tự động clear màn hình"
 }
