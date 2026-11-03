@@ -29,7 +29,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-
+import unicodedata
 __version__ = "1.2.0"
 GITHUB_REPO = "MinhBienK2/omp-manager"
 RAW_SCRIPT_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/omp-manager"
@@ -549,13 +549,10 @@ def table_width(accounts: list[dict], lay: dict, rw: int) -> int:
     """Total width of the table, borders included."""
     aw = acct_w(accounts, lay["acct"])
     cw = cell_w(lay, rw)
-    grade_w = 9 if lay["word"] else 5
-    content = 4 * cw + aw + grade_w
+    content = 4 * cw + aw
     if lay.get("num", True):
         content += 2
-    if lay.get("score", True):
-        content += 5
-    ncols = 4 + 1 + 1 + int(lay.get("num", True)) + int(lay.get("score", True))
+    ncols = 4 + 1 + int(lay.get("num", True))
     return content + 3 * (ncols - 1) + 4
 
 
@@ -591,8 +588,6 @@ def fit_layout(accounts: list[dict], now_ms: float, term_w: int, name: str) -> d
         lay["pct"] -= 1
     if table_width(accounts, lay, rw) > term_w and lay.get("num", True):
         lay["num"] = False                       # drop the "#" column
-    if table_width(accounts, lay, rw) > term_w and lay.get("score", True):
-        lay["score"] = False                     # drop the SCORE column
     return lay
 
 
@@ -618,7 +613,13 @@ def _display_len(s: str) -> int:
                 i += 1
             i += 1
             continue
-        out += 1
+        ch = s[i]
+        cat = unicodedata.category(ch)
+        if cat in ("Mn", "Me", "Cf"):
+            i += 1
+            continue
+        ea = unicodedata.east_asian_width(ch)
+        out += 2 if ea in ("W", "F") else 1
         i += 1
     return out
 
@@ -643,10 +644,8 @@ def render_table(ink: Ink, accounts: list[dict], now_ms: float, narrow: bool,
     rw = reset_w(accounts, now_ms) if lay["reset"] else 0
     cw = cell_w(lay, rw)
     dec = pct_decimals(accounts, lay["pct"])
-    grade_w = 9 if lay["word"] else 5
     titles = BUCKET_TITLES if lay["titles"] == "long" else BUCKET_TITLES_SHORT
     show_num = lay.get("num", True)
-    show_score = lay.get("score", True)
     head_cols = []
     if show_num:
         head_cols.append(("#", 2))
@@ -657,9 +656,6 @@ def render_table(ink: Ink, accounts: list[dict], now_ms: float, narrow: bool,
         (titles["shared-5h"], cw),
         (titles["shared-1w"], cw),
     ]
-    if show_score:
-        head_cols.append(("SCORE", 5))
-    head_cols.append(("GRADE", grade_w))
 
     if not narrow:
         top = ink.grey("╭─" + "─┬─".join("─" * w for _, w in head_cols) + "─╮")
@@ -672,9 +668,6 @@ def render_table(ink: Ink, accounts: list[dict], now_ms: float, narrow: bool,
         rows.append(mid)
 
         for idx, acc in enumerate(accounts, 1):
-            letter, word = grade(acc["score"])
-            score_val = f"{acc['score']:>5.1f}"
-            grade_val = f"{letter} · {word}" if lay["word"] else letter
             c_vals = []
             if show_num:
                 c_vals.append(f"{idx:>2}")
@@ -685,11 +678,6 @@ def render_table(ink: Ink, accounts: list[dict], now_ms: float, narrow: bool,
                 cell(ink, acc, "shared-5h", now_ms, bar_w, rw, pct_w, dec),
                 cell(ink, acc, "shared-1w", now_ms, bar_w, rw, pct_w, dec),
             ]
-            if show_score:
-                c_vals.append(ink.bold(score_val))
-            c_vals.append(
-                ink.cyan(grade_val) if letter in ("S", "A") else (ink.yellow(grade_val) if letter in ("B", "C") else ink.red(grade_val))
-            )
             row_str = ink.grey("│ ") + ink.grey(" │ ").join(pad(v, w) for v, (_, w) in zip(c_vals, head_cols)) + ink.grey(" │")
             rows.append(row_str)
 
@@ -701,9 +689,8 @@ def render_table(ink: Ink, accounts: list[dict], now_ms: float, narrow: bool,
         for idx, acc in enumerate(accounts, 1):
             letter, word = grade(acc["score"])
             title = f" {idx}. {short(acc['email'])} "
-            score_tag = f" {acc['score']:>5.1f} · {letter} · {word} "
-            dashes = max(2, card_w - 4 - len(title) - len(score_tag))
-            top = ink.grey("╭─") + ink.bold(accent_color(ink, acc, title)) + ink.grey("─" * dashes) + ink.cyan(score_tag) + ink.grey("─╮")
+            dashes = max(2, card_w - 4 - len(title))
+            top = ink.grey("╭─") + ink.bold(accent_color(ink, acc, title)) + ink.grey("─" * dashes) + ink.grey("─╮")
             bot = ink.grey("╰" + "─" * (left_w + 2) + "┴" + "─" * (right_w + 2) + "╯")
 
             row1 = (ink.grey("│ ") + pad(f"{BUCKET_TITLES['gemini-5h']} " + cell(ink, acc, "gemini-5h", now_ms, bar_w, rw, pct_w, dec), left_w) +
@@ -716,24 +703,6 @@ def render_table(ink: Ink, accounts: list[dict], now_ms: float, narrow: bool,
 
 def render_card(ink: Ink, payload: dict, accounts: list[dict], now_ms: float, narrow: bool, stale: bool, freshest: float, generated: float, term_w: int | None = None) -> list[str]:
     lines = []
-    recoveries = get_recoveries(accounts, now_ms)
-    cap = (payload.get("capacity") or {}).get(PROVIDER) or []
-    cap_5h = next((f"{c['remainingAccounts']:.1f}x 5h" for c in cap if c.get("window") == "5h"), "")
-    cap_1w = next((f"{c['remainingAccounts']:.1f}x 1w" for c in cap if c.get("window") == "7d"), "")
-    cap_str = " · ".join(filter(None, [cap_5h, cap_1w]))
-
-    def best_for(kind: str):
-        cands = [a for a in accounts if (a["buckets"].get(f"{kind}-5h") or {}).get("remaining", 100) > 0
-                 or (a["buckets"].get(f"{kind}-1w") or {}).get("remaining", 100) > 0]
-        if not cands:
-            return None
-        return min(cands, key=lambda a: (-min((a["buckets"].get(f"{kind}-5h") or {}).get("remaining", 100.0),
-                                              (a["buckets"].get(f"{kind}-1w") or {}).get("remaining", 100.0)),
-                                         -a["score"], a["email"].lower()))
-
-    gem = best_for("gemini")
-    claude = best_for("shared")
-
     # Bucket summary, shared by every card style.
     bucket_lines = []
     for b in BUCKETS:
@@ -743,17 +712,18 @@ def render_card(ink: Ink, payload: dict, accounts: list[dict], now_ms: float, na
         free_cnt = len([a for a, e in zip(accounts, entries) if not e or e["remaining"] > 0])
         bucket_lines.append((b, free_pct, free_cnt))
 
-    right_lines = []
-    gem_str = ink.green(short(gem["email"])) if gem else ink.red("none")
-    claude_str = ink.green(short(claude["email"])) if claude else ink.red("none")
-    right_lines.append(f"★ Best Gemini : {gem_str}")
-    right_lines.append(f"★ Best Claude : {claude_str}")
-    if recoveries:
-        r0 = recoveries[0]
-        right_lines.append(f"⚡ Next relief : {ink.cyan(r0['email'].split('@')[0])} (+{r0['recover_pct']:.0f}% {r0['bucket']} in {fmt_delta(r0['delta'])})")
-    else:
-        right_lines.append("⚡ Next relief : All quotas 100% full")
-    right_lines.append(f"⟳ Pool Cap    : {ink.grey(cap_str if cap_str else 'N/A')}")
+    today_data = get_today_tokens_cached()
+    reqs_str = f"{today_data.get('requests', 0):,}"
+    in_str = fmt_token_num(today_data.get('in', 0))
+    out_str = fmt_token_num(today_data.get('out', 0))
+    tot_str = fmt_token_num(today_data.get('total', 0))
+
+    right_lines = [
+        f"⚡ Today Reqs  : {ink.bold(reqs_str)} reqs",
+        f"📥 Tokens In   : {ink.cyan(in_str)}",
+        f"📤 Tokens Out  : {ink.green(out_str)}",
+        f"∑ Total Tokens : {ink.bold(ink.yellow(tot_str))} tokens",
+    ]
 
     if not narrow:
         left_lines = []
@@ -761,14 +731,11 @@ def render_card(ink: Ink, payload: dict, accounts: list[dict], now_ms: float, na
             bar_str = bar(ink, max(0.0, min(100.0, free_pct)) / 100.0, 10, remaining_color(ink, free_pct))
             left_lines.append(f"{BUCKET_TITLES[b]:<9} {bar_str} {free_pct:>5.1f}% ({free_cnt}/{len(accounts)} ready)")
 
-        # Column widths are measured, not guessed: a long email or a long
-        # countdown must never push a row outside the box.
         lw = max(_display_len(t) for t in left_lines)
         rw = max(_display_len(t) for t in right_lines)
         card_w = lw + rw + 7
 
         if term_w is not None and card_w > term_w:
-            # Slim card for narrow terminals: no frame, no two-column split.
             snap_text = f" snapshot {fmt_age(freshest)}" if not stale else " STALE - rerun with --refresh"
             lines.append(ink.bold(ink.cyan(f"ANTIGRAVITY QUOTA · {len(accounts)} accounts"))
                          + (ink.yellow(snap_text) if stale else ink.grey(snap_text)))
@@ -778,7 +745,7 @@ def render_card(ink: Ink, payload: dict, accounts: list[dict], now_ms: float, na
 
         header_title = f" ANTIGRAVITY QUOTA · {len(accounts)} accounts "
         snap_text = f" snapshot {fmt_age(freshest)} " if not stale else " STALE - rerun with --refresh "
-        mid_dashes = max(2, card_w - 4 - len(header_title) - len(snap_text))
+        mid_dashes = max(2, card_w - 4 - _display_len(header_title) - _display_len(snap_text))
         snap_colored = ink.yellow(snap_text) if stale else ink.grey(snap_text)
         top_line = ink.grey("╭─") + ink.bold(ink.cyan(header_title)) + ink.grey("─" * mid_dashes) + snap_colored + ink.grey("─╮")
         lines.append(top_line)
@@ -789,22 +756,13 @@ def render_card(ink: Ink, payload: dict, accounts: list[dict], now_ms: float, na
         for l_txt, r_txt in zip(left_lines, right_lines):
             lines.append(border_l + pad(l_txt, lw) + div + pad(r_txt, rw) + border_r)
 
-        today_data = get_today_tokens_cached()
-        reqs_str = f"{today_data.get('requests', 0):,}"
-        in_str = fmt_token_num(today_data.get('in', 0))
-        out_str = fmt_token_num(today_data.get('out', 0))
-        tot_str = fmt_token_num(today_data.get('total', 0))
-
-        lines.append(ink.grey("├" + "─" * (lw + 2) + "┴" + "─" * (rw + 2) + "┤"))
-        today_text = f"⚡ TODAY USAGE : {ink.bold(reqs_str)} reqs  ·  In: {ink.cyan(in_str)}  ·  Out: {ink.green(out_str)}  ·  Total: {ink.bold(ink.yellow(tot_str))} tokens"
-        inner_w = lw + rw + 3
-        lines.append(border_l + pad(today_text, inner_w) + border_r)
-        lines.append(ink.grey("╰" + "─" * (inner_w + 2) + "╯"))
+        bot_line = ink.grey("╰" + "─" * (lw + 2) + "┴" + "─" * (rw + 2) + "╯")
+        lines.append(bot_line)
     else:
         card_w = 72
         header_title = f" ANTIGRAVITY QUOTA · {len(accounts)} accounts "
         snap_text = f" {fmt_age(freshest)} " if not stale else " STALE "
-        dashes = max(2, card_w - 4 - len(header_title) - len(snap_text))
+        dashes = max(2, card_w - 4 - _display_len(header_title) - _display_len(snap_text))
         snap_colored = ink.yellow(snap_text) if stale else ink.grey(snap_text)
         top_line = ink.grey("╭─") + ink.bold(ink.cyan(header_title)) + ink.grey("─" * dashes) + snap_colored + ink.grey("─╮")
         lines.append(top_line)
@@ -816,20 +774,9 @@ def render_card(ink: Ink, payload: dict, accounts: list[dict], now_ms: float, na
 
         lines.append(ink.grey("├" + "─" * (card_w - 2) + "┤"))
 
-        lines.append(ink.grey("│") + pad(f" ★ Best Gemini : {gem_str}", card_w - 2) + ink.grey("│"))
-        lines.append(ink.grey("│") + pad(f" ★ Best Claude : {claude_str}", card_w - 2) + ink.grey("│"))
-        if recoveries:
-            r0 = recoveries[0]
-            lines.append(ink.grey("│") + pad(f" ⚡ Next relief : {ink.cyan(r0['email'].split('@')[0])} (+{r0['recover_pct']:.0f}% {r0['bucket']} in {fmt_delta(r0['delta'])})", card_w - 2) + ink.grey("│"))
-        today_data = get_today_tokens_cached()
-        reqs_str = f"{today_data.get('requests', 0):,}"
-        in_str = fmt_token_num(today_data.get('in', 0))
-        out_str = fmt_token_num(today_data.get('out', 0))
-        tot_str = fmt_token_num(today_data.get('total', 0))
-        lines.append(ink.grey("│") + pad(f" ⟳ Pool Cap    : {ink.grey(cap_str if cap_str else 'N/A')}", card_w - 2) + ink.grey("│"))
-        lines.append(ink.grey("├" + "─" * (card_w - 2) + "┤"))
-        today_text = f" ⚡ TODAY USAGE : {ink.bold(reqs_str)} reqs · In: {ink.cyan(in_str)} · Out: {ink.green(out_str)} · Total: {ink.bold(ink.yellow(tot_str))}"
-        lines.append(ink.grey("│") + pad(today_text, card_w - 2) + ink.grey("│"))
+        for r_txt in right_lines:
+            lines.append(ink.grey("│") + pad(f" {r_txt}", card_w - 2) + ink.grey("│"))
+
         lines.append(ink.grey("╰" + "─" * (card_w - 2) + "╯"))
 
     return lines
@@ -846,23 +793,14 @@ def render_mini(ink: Ink, payload: dict, accounts: list[dict], now_ms: float) ->
     g1_rem = (100 - (sum(e["used"] for e in g1_rep) / len(g1_rep))) if g1_rep else 100.0
     g1_cnt = len([a for a, e in zip(accounts, g1) if not e or e["remaining"] > 0])
 
-    best = accounts[0]
-    letter, _ = grade(best["score"])
-
     parts = [
         f"{ink.bold('[AGY ' + str(len(accounts)) + 'acc]')}",
         f"G5h: {remaining_color(ink, g5_rem)(f'{g5_rem:.0f}%')} ({g5_cnt}/{len(accounts)})",
         f"G1w: {remaining_color(ink, g1_rem)(f'{g1_rem:.0f}%')} ({g1_cnt}/{len(accounts)})",
-        f"Best: {ink.green(short(best['email']).split('@')[0])} ({best['score']:.0f} {letter})",
     ]
-    recoveries = get_recoveries(accounts, now_ms)
-    if recoveries:
-        r0 = recoveries[0]
-        parts.append(f"Next: {ink.cyan(r0['email'].split('@')[0])} (+{r0['recover_pct']:.0f}% in {fmt_delta(r0['delta'])})")
     today_data = get_today_tokens_cached()
     parts.append(f"Today: {fmt_token_num(today_data.get('requests', 0))} reqs, {fmt_token_num(today_data.get('total', 0))} tok")
     return " · ".join(parts)
-
 
 def render(ink: Ink, payload: dict, accounts: list[dict], args, weights: dict, preset: str) -> str:
     now_ms = time.time() * 1000
@@ -885,9 +823,8 @@ def render(ink: Ink, payload: dict, accounts: list[dict], args, weights: dict, p
     out = render_card(ink, payload, accounts, now_ms, narrow=is_narrow, stale=stale,
                       freshest=freshest, generated=generated, term_w=term_w)
     out.append("")
-    out.append(ink.bold("RANKING  " + ink.grey(f"(best -> worst · ranked by {preset})")))
+    out.append(ink.bold("RANKING  " + ink.grey(f"(ranked by {preset})")))
     out.append(render_table(ink, accounts, now_ms, narrow=is_narrow, lay=lay))
-    out.append("")
 
     extras = [(a["email"], e) for a in accounts for e in a["extra"]]
     if extras:
@@ -906,23 +843,6 @@ def render(ink: Ink, payload: dict, accounts: list[dict], args, weights: dict, p
                 out.append("  " + (r if isinstance(r, str) else json.dumps(r))[:120])
             out.append("")
 
-    short_titles = BUCKET_TITLES_SHORT if lay["titles"] == "short" else BUCKET_TITLES
-    grades_txt = " ".join(f"{letter}≥{thr}" for thr, letter, _ in GRADES[:-1]) + " F<15"
-    if term_w >= 170:
-        out.append(ink.grey(f"bar & % = quota remaining  ·  grade: {grades_txt}"))
-        out.append(ink.grey(f"score weights ({preset}): "
-                            + "  ".join(f"{BUCKET_TITLES[b]} {weights[b]:.2f}" for b in BUCKETS)
-                            + " · n/r = window not reported (counted as fresh)"
-                            + " · switch with --by gemini|balanced|claude"))
-    elif term_w >= 80:
-        out.append(ink.grey(f"bar & % = quota remaining  ·  grade: {grades_txt}"))
-        out.append(ink.grey(f"weights ({preset}): "
-                            + " ".join(f"{short_titles[b]} {weights[b]:.2f}" for b in BUCKETS)
-                            + " · n/r = not reported"))
-    else:
-        out.append(ink.grey(f"bar & % = remaining · {grades_txt}"))
-        out.append(ink.grey(f"weights: "
-                            + " ".join(f"{short_titles[b]} {weights[b]:.2f}" for b in BUCKETS)))
     return "\n".join(out)
 
 def term_width() -> int:
@@ -1130,6 +1050,9 @@ def main() -> None:
     ap.add_argument("--no-update", action="store_true",
                     default=config_env("NO_UPDATE") is not None,
                     help="skip the background update check")
+    ap.add_argument("--no-clear", action="store_true",
+                    default=config_env("NO_CLEAR") is not None,
+                    help="do not clear the screen before rendering")
     args = ap.parse_args()
 
     ink = Ink(supports_color(args.color))
@@ -1206,6 +1129,10 @@ def main() -> None:
             "today": get_today_tokens_cached(),
         }, indent=2))
         return
+    if not args.no_clear and sys.stdout.isatty():
+        if os.system("clear") != 0:
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
     print(render(ink, payload, accounts, args, weights, preset))
 
 

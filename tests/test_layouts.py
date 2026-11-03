@@ -70,10 +70,9 @@ class LayoutTest(unittest.TestCase):
         self.assertIn(tier, ("compact", "tight", "micro"))
 
     def test_fit_layout_shrinks_under_tight_width(self):
-        fitted = om.fit_layout(self.accounts, self.now_ms, term_w=65, name="micro")
+        fitted = om.fit_layout(self.accounts, self.now_ms, term_w=55, name="micro")
         self.assertLessEqual(fitted["acct"], om.ACCT_MIN)
         self.assertFalse(fitted.get("num", True))
-
     def test_pct_decimals(self):
         self.assertEqual(om.pct_decimals(self.accounts, pct_w=6), 1)
         self.assertEqual(om.pct_decimals(self.accounts, pct_w=4), 0)

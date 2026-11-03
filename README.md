@@ -14,29 +14,24 @@
 ## 📸 Giao diện minh họa
 
 ```
-╭─ ANTIGRAVITY QUOTA · 3 accounts ─────────────────────────── snapshot 0m30s ago ─╮
-│ GEMINI 5H █████████─  93.9% (3/3 ready) │ ★ Best Gemini : alice@example.com    │
-│ GEMINI 1W █████─────  45.1% (3/3 ready) │ ★ Best Claude : bob@example.com      │
-│ C&G 5H    ██████████ 100.0% (3/3 ready) │ ⚡ Next relief : All quotas 100% full │
-│ C&G 1W    ████──────  43.4% (3/3 ready) │ ⟳ Pool Cap    : 2.7x 5h · 0.9x 1w    │
-├─────────────────────────────────────────┴──────────────────────────────────────┤
-│ ⚡ TODAY USAGE : 6,491 reqs  ·  In: 206.4M  ·  Out: 2.8M  ·  Total: 209.3M tokens │
-╰────────────────────────────────────────────────────────────────────────────────╯
+╭─ ANTIGRAVITY QUOTA · 3 accounts ──────────────────── snapshot 0m30s ago ─╮
+│ GEMINI 5H █████████─  93.9% (3/3 ready) │ ⚡ Today Reqs  : 6,491 reqs    │
+│ GEMINI 1W █████─────  45.1% (3/3 ready) │ 📥 Tokens In   : 206.4M        │
+│ C&G 5H    ██████████ 100.0% (3/3 ready) │ 📤 Tokens Out  : 2.8M          │
+│ C&G 1W    ████──────  43.4% (3/3 ready) │ ∑ Total Tokens : 209.3M tokens │
+╰─────────────────────────────────────────┴────────────────────────────────╯
 
-RANKING  (best -> worst · ranked by gemini)
-╭────┬───────────────────┬────────────┬────────────┬────────────┬────────────┬───────┬───────╮
-│ #  │ ACCOUNT           │ G5H        │ G1W        │ C5H        │ C1W        │ SCORE │ GRADE │
-├────┼───────────────────┼────────────┼────────────┼────────────┼────────────┼───────┼───────┤
-│  1 │ alice@example.com │ ████   98% │ ████   91% │ ████  100% │ █───   34% │  82.6 │ A     │
-│  2 │ bob@example.com   │ ███─   84% │ ██──   44% │ ████  100% │ ██──   48% │  62.3 │ B     │
-│  3 │ carol@example.com │ ████  100% │ ────    0% │ ████  100% │ ██──   48% │  49.8 │ C     │
-╰────┴───────────────────┴────────────┴────────────┴────────────┴────────────┴───────┴───────╯
+RANKING  (ranked by gemini)
+╭────┬───────────────────┬────────────┬────────────┬────────────┬────────────╮
+│ #  │ ACCOUNT           │ G5H        │ G1W        │ C5H        │ C1W        │
+├────┼───────────────────┼────────────┼────────────┼────────────┼────────────┤
+│  1 │ alice@example.com │ ████   98% │ ████   91% │ ████  100% │ █───   34% │
+│  2 │ bob@example.com   │ ███─   84% │ ██──   44% │ ████  100% │ ██──   48% │
+│  3 │ carol@example.com │ ████  100% │ ────    0% │ ████  100% │ ██──   48% │
+╰────┴───────────────────┴────────────┴────────────┴────────────┴────────────╯
 
 OTHER METERS  (not part of the score)
   alice@example.com     Gemini Pro 5h     87.5% left · reset now
-
-bar & % = quota remaining  ·  grade: S≥90 A≥75 B≥55 C≥35 D≥15 F<15
-weights (gemini): G5H 0.30 G1W 0.40 C5H 0.10 C1W 0.20 · n/r = not reported
 ```
 
 ---
@@ -49,7 +44,7 @@ weights (gemini): G5H 0.30 G1W 0.40 C5H 0.10 C1W 0.20 · n/r = not reported
 - 🤝 **Hỗ trợ song song 2 tên lệnh `omp-manager` và `ompagy`**: Tự động nhận diện tên file đang chạy (`sys.argv[0]`) để đổi tiêu đề, cờ giúp đỡ và biến môi trường tương ứng (`OMP_MANAGER_*` hoặc `OMPAGY_*`).
 - 📊 **Thanh Quota Bar và % còn lại nhất quán**: Cả thanh đồ họa và con số % đều biểu thị lượng hạn mức còn lại (`remaining`), không gây nhầm lẫn giữa lượng đã dùng và lượng còn lại.
 - 🎯 **Chấm điểm thông minh & Xếp hạng**: Đánh giá chất lượng tài khoản từ `0` đến `100` và phân loại từ hạng `S` (nguyên vẹn) tới `F` (hạn mức cạn kiệt).
-- 🏆 **Gợi ý tài khoản tối ưu**: Hiển thị ngay `★ Best Gemini` và `★ Best Claude`.
+- 🧹 **Tự động làm sạch màn hình (`Screen Clear`)**: Tự động dọn sạch màn hình terminal trước khi vẽ bảng, giúp giao diện hiển thị gọn gàng (hỗ trợ cờ `--no-clear`).
 - 🚀 **Chế độ Mini (`--mini`)**: Một dòng tóm tắt siêu nhẹ cho thanh trạng thái của **tmux**, **starship**, hoặc prompt shell.
 - 🔄 **Xuất dữ liệu chuẩn JSON (`--json`)**: Tích hợp với automation pipeline hoặc cronjob.
 
